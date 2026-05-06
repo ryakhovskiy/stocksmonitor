@@ -18,6 +18,7 @@ import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 
@@ -50,6 +51,7 @@ public class YahooAPI {
     private final Map<String, List<QuoteItem>> quotesCache = Collections.synchronizedMap(new LRUMap<>(10000));
     private final Map<String, List<NewsItem>> newsCache = Collections.synchronizedMap(new LRUMap<>(2000));
     private final Map<String, List<HistoricalBar>> historyCache = Collections.synchronizedMap(new LRUMap<>(2000));
+    private final Map<String, List<Dividend>> dividendCache = Collections.synchronizedMap(new LRUMap<>(2000));
 
     public static YahooAPI getInstance() {
         return instance;
@@ -172,6 +174,52 @@ public class YahooAPI {
             ));
         }
         historyCache.putIfAbsent(key, bars);
+        return bars;
+    }
+
+    public List<Dividend> getDividends(String symbol, LocalDate from, LocalDate to) throws IOException {
+        if (from == null || to == null || from.isAfter(to)) return Collections.emptyList();
+        final String key = symbol + "|" + from + "|" + to;
+        List<Dividend> cached = dividendCache.get(key);
+        if (cached != null) return cached;
+
+        final ZoneId zone = ZoneId.systemDefault();
+        long period1 = from.atStartOfDay(zone).toEpochSecond();
+        long period2 = to.plusDays(1).atStartOfDay(zone).toEpochSecond();
+        final String url = CHART_BASE_URL + URLEncoder.encode(symbol, StandardCharsets.UTF_8);
+        final NameValuePair[] parameters = {
+                new BasicNameValuePair("period1", Long.toString(period1)),
+                new BasicNameValuePair("period2", Long.toString(period2)),
+                new BasicNameValuePair("interval", "1d"),
+                new BasicNameValuePair("events", "div")
+        };
+        String response = RestUtils.getInstance().runQuery(url, parameters);
+        JSONObject result = firstChartResult(response, symbol);
+        if (result == null) return Collections.emptyList();
+
+        // Yahoo omits 'events' / 'events.dividends' when no payouts fall in the range — that's a real "no data" answer, cache it.
+        JSONObject events = result.optJSONObject("events");
+        JSONObject dividends = events == null ? null : events.optJSONObject("dividends");
+        if (dividends == null) {
+            dividendCache.putIfAbsent(key, Collections.emptyList());
+            return Collections.emptyList();
+        }
+
+        List<Dividend> bars = new ArrayList<>();
+        for (String tsKey : dividends.keySet()) {
+            JSONObject d = dividends.optJSONObject(tsKey);
+            if (d == null) continue;
+            long ts = d.optLong("date", 0);
+            if (ts == 0) {
+                try { ts = Long.parseLong(tsKey); } catch (NumberFormatException ignore) { continue; }
+            }
+            double amount = d.optDouble("amount", Double.NaN);
+            if (Double.isNaN(amount)) continue;
+            LocalDate date = Instant.ofEpochSecond(ts).atZone(zone).toLocalDate();
+            bars.add(new Dividend(symbol, date, amount));
+        }
+        bars.sort(Comparator.comparing(Dividend::date));
+        dividendCache.putIfAbsent(key, bars);
         return bars;
     }
 

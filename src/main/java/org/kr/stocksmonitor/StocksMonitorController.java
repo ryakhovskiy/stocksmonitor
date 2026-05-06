@@ -33,6 +33,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.kr.stocksmonitor.config.ConfigManager;
 import org.kr.stocksmonitor.utils.LogUtils;
+import org.kr.stocksmonitor.yahoo.Dividend;
 import org.kr.stocksmonitor.yahoo.HistoricalBar;
 import org.kr.stocksmonitor.yahoo.NewsItem;
 import org.kr.stocksmonitor.yahoo.QuoteItem;
@@ -71,6 +72,7 @@ public class StocksMonitorController implements Initializable {
     private final AtomicLong dataRequestId = new AtomicLong();
     private final AtomicLong historyRequestId = new AtomicLong();
     private final AtomicLong chartRequestId = new AtomicLong();
+    private final AtomicLong dividendRequestId = new AtomicLong();
     private static final int DEFAULT_HISTORY_DAYS = 365;
     private static final int DEFAULT_SLIDER_POSITION = 10; // matches "1 year" in applyDateRange
     private static final DateTimeFormatter NEWS_DATE_FORMAT =
@@ -122,6 +124,7 @@ public class StocksMonitorController implements Initializable {
             else if (newValue == tabData) handleTabDataSelection();
             else if (newValue == tabHistory) handleTabHistorySelection();
             else if (newValue == tabChart) handleTabChartSelection();
+            else if (newValue == tabDividend) handleTabDividendSelection();
         });
         setYahooTableFavoriteQuotesColumns();
     }
@@ -184,6 +187,7 @@ public class StocksMonitorController implements Initializable {
         else if (active == tabData) loadDataForSelection(selectedQuotes);
         else if (active == tabHistory) loadHistoryForSelection(selectedQuotes);
         else if (active == tabChart) loadChartForSelection(selectedQuotes);
+        else if (active == tabDividend) loadDividendForSelection(selectedQuotes);
     }
 
     private void handleTabNewsSelection() {
@@ -206,6 +210,11 @@ public class StocksMonitorController implements Initializable {
         loadChartForSelection(yahooTableFavoriteQuotes.getSelectionModel().getSelectedItems());
     }
 
+    private void handleTabDividendSelection() {
+        log.debug("handleTabDividendSelection()");
+        loadDividendForSelection(yahooTableFavoriteQuotes.getSelectionModel().getSelectedItems());
+    }
+
     private void scheduleDateDependentReload() {
         ScheduledFuture<?> prev = pendingDateReload.getAndSet(null);
         if (prev != null) prev.cancel(false);
@@ -215,6 +224,7 @@ public class StocksMonitorController implements Initializable {
                     List<QuoteItem> selected = yahooTableFavoriteQuotes.getSelectionModel().getSelectedItems();
                     if (active == tabHistory) loadHistoryForSelection(selected);
                     else if (active == tabChart) loadChartForSelection(selected);
+                    else if (active == tabDividend) loadDividendForSelection(selected);
                 }),
                 250, TimeUnit.MILLISECONDS);
         pendingDateReload.set(future);
@@ -374,6 +384,55 @@ public class StocksMonitorController implements Initializable {
             });
             LogUtils.debugDuration(log, start, "loading yahoo history");
         });
+    }
+
+    private void loadDividendForSelection(List<QuoteItem> selected) {
+        final List<String> symbols = symbolsOf(selected);
+        if (symbols.isEmpty()) {
+            showTabMessage(tabDividend, "Select a ticker to see dividends");
+            return;
+        }
+        final LocalDate from = yahooStartDatePicker.getValue();
+        final LocalDate to = yahooEndDatePicker.getValue();
+        if (from == null || to == null || from.isAfter(to)) {
+            showTabMessage(tabDividend, "Pick a valid start/end date");
+            return;
+        }
+        showTabMessage(tabDividend, "Loading dividends...");
+        final long requestId = dividendRequestId.incrementAndGet();
+        executorService.submit(() -> {
+            Instant start = Instant.now();
+            List<Dividend> dividends = new ArrayList<>();
+            for (String symbol : symbols) {
+                try {
+                    dividends.addAll(YahooAPI.getInstance().getDividends(symbol, from, to));
+                } catch (IOException e) {
+                    log.error("Error fetching dividends for {} {}..{}", symbol, from, to, e);
+                }
+            }
+            dividends.sort(Comparator.comparing(Dividend::date).reversed()
+                    .thenComparing(Dividend::symbol));
+            Platform.runLater(() -> {
+                if (requestId != dividendRequestId.get()) return;
+                renderDividend(dividends);
+            });
+            LogUtils.debugDuration(log, start, "loading yahoo dividends");
+        });
+    }
+
+    private void renderDividend(List<Dividend> dividends) {
+        if (dividends.isEmpty()) {
+            showTabMessage(tabDividend, "No dividends found for the selected range");
+            return;
+        }
+        TableView<Dividend> table = new TableView<>();
+        table.getColumns().add(strCol("Symbol", Dividend::symbol, 100));
+        table.getColumns().add(strCol("Date", d -> HIST_DATE_FORMAT.format(d.date()), 120));
+        table.getColumns().add(numCol("Amount", Dividend::amount, 120));
+
+        table.getItems().setAll(dividends);
+        table.setColumnResizePolicy(TableView.CONSTRAINED_RESIZE_POLICY_ALL_COLUMNS);
+        tabDividend.setContent(new StackPane(table));
     }
 
     private static List<String> symbolsOf(List<QuoteItem> selected) {
@@ -754,6 +813,7 @@ public class StocksMonitorController implements Initializable {
     @FXML protected Tab tabData;
     @FXML protected Tab tabHistory;
     @FXML protected Tab tabChart;
+    @FXML protected Tab tabDividend;
     @FXML protected TabPane tabPaneData;
     @FXML protected ComboBox<QuoteItem> cbxYahooQuote;
 }
