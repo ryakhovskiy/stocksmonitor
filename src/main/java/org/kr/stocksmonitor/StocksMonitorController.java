@@ -20,6 +20,7 @@ import javafx.util.StringConverter;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.kr.stocksmonitor.config.ConfigManager;
+import org.kr.stocksmonitor.polygon.Ticker;
 import org.kr.stocksmonitor.utils.LogUtils;
 import org.kr.stocksmonitor.yahoo.QuoteItem;
 import org.kr.stocksmonitor.yahoo.YahooAPI;
@@ -29,12 +30,15 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.UnaryOperator;
 
 public class StocksMonitorController implements Initializable {
 
     private static final Logger log = LogManager.getLogger(StocksMonitorController.class);
     protected static final ExecutorService executorService = Executors.newFixedThreadPool(16);
+    private final ScheduledExecutorService debounceExecutor = Executors.newSingleThreadScheduledExecutor();
+    private final AtomicReference<ScheduledFuture<?>> pendingSearch = new AtomicReference<>();
     public DatePicker yahooStartDatePicker;
     public DatePicker yahooEndDatePicker;
     public Slider yahooDateRangeSlider;
@@ -177,18 +181,20 @@ public class StocksMonitorController implements Initializable {
         if (value.isEmpty())
             return;
         log.debug("reloading yahoo quotes data: {}", value);
-        executorService.submit(() -> {
-            Platform.runLater(() -> {
-                Instant start = Instant.now();
-                try {
-                    reloadYahooQuotesCombobox(YahooAPI.getInstance().getQuotes(value));
-                } catch (Exception e) {
-                    log.error("Error while reloading the yahoo quotes", e);
-                } finally {
-                    LogUtils.debugDuration(log, start, "reloading yahoo quotes");
-                }
-            });
-        });
+        ScheduledFuture<?> prev = pendingSearch.getAndSet(null);
+        if (prev != null) prev.cancel(false);
+        ScheduledFuture<?> future = debounceExecutor.schedule(() -> {
+            Instant start = Instant.now();
+            try {
+                List<QuoteItem> quotes = YahooAPI.getInstance().getQuotes(value);
+                Platform.runLater(() -> reloadYahooQuotesCombobox(quotes));
+            } catch (Exception e) {
+                log.error("Error while reloading the yahoo quotes", e);
+            } finally {
+                LogUtils.debugDuration(log, start, "reloading yahoo quotes");
+            }
+        }, 300, TimeUnit.MILLISECONDS);
+        pendingSearch.set(future);
     }
 
     private void reloadYahooQuotesCombobox(List<QuoteItem> quotes) {
@@ -240,6 +246,7 @@ public class StocksMonitorController implements Initializable {
     public void shutdown() throws IOException {
         log.debug("shutting down the controller");
         executorService.shutdown();
+        debounceExecutor.shutdown();
         var favoriteQuotes = yahooTableFavoriteQuotes.getItems();
         ConfigManager.getInstance().saveFavoriteQuotes(favoriteQuotes);
     }
@@ -256,112 +263,41 @@ public class StocksMonitorController implements Initializable {
     }
 
     private void setDatePickersBasedOnSlider() {
-        int dateRangeSliderValue = (int) yahooDateRangeSlider.getValue();
-        switch (dateRangeSliderValue) {
-            case 1:
-                yahooDateRangeLabel.setText("1 day");
-                yahooStartDatePicker.setValue(LocalDate.now().minusDays(1));
-                yahooEndDatePicker.setValue(LocalDate.now());
-                break;
+        applyDateRange((int) yahooDateRangeSlider.getValue(), yahooDateRangeLabel, yahooStartDatePicker, yahooEndDatePicker);
+    }
 
-            case 2:
-                yahooDateRangeLabel.setText("2 days");
-                yahooStartDatePicker.setValue(LocalDate.now().minusDays(2));
-                yahooEndDatePicker.setValue(LocalDate.now());
-                break;
-
-            case 3:
-                yahooDateRangeLabel.setText("3 days");
-                yahooStartDatePicker.setValue(LocalDate.now().minusDays(3));
-                yahooEndDatePicker.setValue(LocalDate.now());
-                break;
-
-            case 4:
-                yahooDateRangeLabel.setText("1 week");
-                yahooStartDatePicker.setValue(LocalDate.now().minusDays(7));
-                yahooEndDatePicker.setValue(LocalDate.now());
-                break;
-
-            case 5:
-                yahooDateRangeLabel.setText("2 weeks");
-                yahooStartDatePicker.setValue(LocalDate.now().minusDays(14));
-                yahooEndDatePicker.setValue(LocalDate.now());
-                break;
-
-            case 6:
-                yahooDateRangeLabel.setText("1 month");
-                yahooStartDatePicker.setValue(LocalDate.now().minusMonths(1));
-                yahooEndDatePicker.setValue(LocalDate.now());
-                break;
-
-            case 7:
-                yahooDateRangeLabel.setText("2 months");
-                yahooStartDatePicker.setValue(LocalDate.now().minusMonths(2));
-                yahooEndDatePicker.setValue(LocalDate.now());
-                break;
-
-            case 8:
-                yahooDateRangeLabel.setText("3 months");
-                yahooStartDatePicker.setValue(LocalDate.now().minusMonths(3));
-                yahooEndDatePicker.setValue(LocalDate.now());
-                break;
-
-            case 9:
-                yahooDateRangeLabel.setText("6 months");
-                yahooStartDatePicker.setValue(LocalDate.now().minusMonths(6));
-                yahooEndDatePicker.setValue(LocalDate.now());
-                break;
-
-            case 10:
-                yahooDateRangeLabel.setText("1 year");
-                yahooStartDatePicker.setValue(LocalDate.now().minusYears(1));
-                yahooEndDatePicker.setValue(LocalDate.now());
-                break;
-
-            case 11:
-                yahooDateRangeLabel.setText("2 years");
-                yahooStartDatePicker.setValue(LocalDate.now().minusYears(2));
-                yahooEndDatePicker.setValue(LocalDate.now());
-                break;
-
-            case 12:
-                yahooDateRangeLabel.setText("3 years");
-                yahooStartDatePicker.setValue(LocalDate.now().minusYears(3));
-                yahooEndDatePicker.setValue(LocalDate.now());
-                break;
-
-            case 13:
-                yahooDateRangeLabel.setText("5 years");
-                yahooStartDatePicker.setValue(LocalDate.now().minusYears(5));
-                yahooEndDatePicker.setValue(LocalDate.now());
-                break;
-
-            case 14:
-                yahooDateRangeLabel.setText("10 years");
-                yahooStartDatePicker.setValue(LocalDate.now().minusYears(10));
-                yahooEndDatePicker.setValue(LocalDate.now());
-                break;
-
-            case 15:
-                yahooDateRangeLabel.setText("MAX");
-                yahooStartDatePicker.setValue(LocalDate.now().minusYears(200));
-                yahooEndDatePicker.setValue(LocalDate.now());
-                break;
-
-            default:
-                break;
+    static void applyDateRange(int value, Label label, DatePicker start, DatePicker end) {
+        LocalDate today = LocalDate.now();
+        switch (value) {
+            case 1:  label.setText("1 day");    start.setValue(today.minusDays(1));    break;
+            case 2:  label.setText("2 days");   start.setValue(today.minusDays(2));    break;
+            case 3:  label.setText("3 days");   start.setValue(today.minusDays(3));    break;
+            case 4:  label.setText("1 week");   start.setValue(today.minusDays(7));    break;
+            case 5:  label.setText("2 weeks");  start.setValue(today.minusDays(14));   break;
+            case 6:  label.setText("1 month");  start.setValue(today.minusMonths(1));  break;
+            case 7:  label.setText("2 months"); start.setValue(today.minusMonths(2));  break;
+            case 8:  label.setText("3 months"); start.setValue(today.minusMonths(3));  break;
+            case 9:  label.setText("6 months"); start.setValue(today.minusMonths(6));  break;
+            case 10: label.setText("1 year");   start.setValue(today.minusYears(1));   break;
+            case 11: label.setText("2 years");  start.setValue(today.minusYears(2));   break;
+            case 12: label.setText("3 years");  start.setValue(today.minusYears(3));   break;
+            case 13: label.setText("5 years");  start.setValue(today.minusYears(5));   break;
+            case 14: label.setText("10 years"); start.setValue(today.minusYears(10));  break;
+            case 15: label.setText("MAX");      start.setValue(today.minusYears(200)); break;
+            default: break;
         }
+        end.setValue(today);
     }
 
     @FXML protected Tab tabNews;
     @FXML protected TabPane tabPaneData;
-    @FXML protected ComboBox cbxYahooQuote;
+    @FXML protected ComboBox<QuoteItem> cbxYahooQuote;
 
-    
+
     //polygon controls
     @FXML protected PasswordField tfApiKey;
-    @FXML protected ComboBox cbxTicker;
-    @FXML protected TableView tblTickers;
+    @FXML protected ComboBox<Ticker> cbxTicker;
+    @FXML protected TableView<Ticker> tblTickers;
     @FXML protected DatePicker startDatePicker;
     @FXML protected DatePicker endDatePicker;
     @FXML protected Slider dateRangeSlider;

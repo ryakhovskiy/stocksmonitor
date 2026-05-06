@@ -30,12 +30,6 @@ public class RestUtils2 {
     private final LRUMap cache = new LRUMap(30000);
 
     private RestUtils2() {
-        try {
-            final String res = runQuery("https://query1.finance.yahoo.com/v1/finance/search", new BasicNameValuePair("q", "STOXX"));
-            log.debug("{} initialized: {}", RestUtils2.class.getName(), res);
-        } catch (IOException e) {
-            log.error(e);
-        }
     }
 
     public String runQuery(String url, NameValuePair... parameters) throws IOException {
@@ -43,10 +37,10 @@ public class RestUtils2 {
         final String key = String.format("%s, %s", url, Arrays.toString(parameters));
         final Object cacheHit = cache.get(key);
         if (null != cacheHit) return cacheHit.toString();
-        try {
-            CloseableHttpClient client = HttpClients.custom()
+        try (CloseableHttpClient client = HttpClients.custom()
                 .setConnectionManager(poolingConnManager)
-                .build();
+                .setConnectionManagerShared(true)
+                .build()) {
             final ClassicHttpRequest httpGet = ClassicRequestBuilder
                     .get(url)
                     .addParameters(parameters)

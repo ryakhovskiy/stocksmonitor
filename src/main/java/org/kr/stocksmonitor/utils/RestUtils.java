@@ -88,20 +88,25 @@ public class RestUtils {
     private void enforceRateLimit() {
         logger.debug("enforcing rate limit...");
         Instant start = Instant.now();
+        long sleepMs = 0;
         synchronized (lastXCalls) {
             lastXCalls.offer(start.toEpochMilli());
             while (lastXCalls.size() >= maxCallsPerMinute) {
                 long firstCall = lastXCalls.pollFirst();
                 final long timeSinceFirstCall = System.currentTimeMillis() - firstCall;
                 if (timeSinceFirstCall <= 60_000) {
-                    try {
-                        long sleep_time = 60_050 - timeSinceFirstCall;
-                        logger.debug("enforcing rate limit, sleeping for: {}", sleep_time);
-                        Thread.sleep(sleep_time);
-                    } catch (InterruptedException e) {
-                        logger.error(e);
-                    }
+                    sleepMs = 60_050 - timeSinceFirstCall;
+                    break;
                 }
+            }
+        }
+        if (sleepMs > 0) {
+            try {
+                logger.debug("enforcing rate limit, sleeping for: {}", sleepMs);
+                Thread.sleep(sleepMs);
+            } catch (InterruptedException e) {
+                logger.error(e);
+                Thread.currentThread().interrupt();
             }
         }
         LogUtils.debugDuration(logger, start, "enforceRateLimit()");

@@ -73,7 +73,7 @@ public class PolygonAPI {
         final List<NameValuePair> parameters = Arrays.asList(
                 new BasicNameValuePair("published_utc.gte", start.format(dateFormatter)),
                 new BasicNameValuePair("published_utc.lte", end.format(dateFormatter)),
-                new BasicNameValuePair("ticker", ticker.ticker),
+                new BasicNameValuePair("ticker", ticker.getTicker()),
                 new BasicNameValuePair("limit", "1000"),
                 new BasicNameValuePair("sort", "published_utc")
         );
@@ -85,7 +85,11 @@ public class PolygonAPI {
         String nextUrl = baseURL;
         List<NewsArticle> news = new ArrayList<>();
         while (null != nextUrl && !nextUrl.isEmpty()) {
-            String response = restUtils.callPolygonEndpoint(baseURL, tickerNewsGET, apiKey, parameters);
+            String response;
+            if (news.isEmpty())
+                response = restUtils.callPolygonEndpoint(baseURL, tickerNewsGET, apiKey, parameters);
+            else
+                response = restUtils.callPolygonEndpoint(nextUrl, "", apiKey, Collections.emptyList());
             var res = parseResponseHeader(response);
             nextUrl = res.getFirst();
             var results = res.getSecond();

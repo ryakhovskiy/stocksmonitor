@@ -159,7 +159,7 @@ public class ConfigManager {
     private FileBasedConfigurationBuilder<JSONConfiguration> getConfigBuilder() {
         Parameters params = new Parameters();
         return new FileBasedConfigurationBuilder<>(JSONConfiguration.class)
-                        .configure(params.fileBased().setFile(FAVORITE_QUOTES_PATH.toFile()));
+                        .configure(params.fileBased().setFile(CONFIG_FILE_PATH.toFile()));
     }
 
     public List<QuoteItem> readFavoriteQuotes() {

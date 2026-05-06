@@ -52,7 +52,9 @@ public class PolygonController implements PolygonAPI.ProgressCallback {
     public void initialize() {
         initTickersCombobox();
         initSettings();
+        initDatePickers();
         loadTickers();
+        initTableView();
     }
 
     private void createNewsTableView(List<NewsArticle> news) {
@@ -432,100 +434,10 @@ public class PolygonController implements PolygonAPI.ProgressCallback {
     }
 
     private void setDatePickersBasedOnSlider() {
-        int dateRangeSliderValue = (int) controller.dateRangeSlider.getValue();
-        switch (dateRangeSliderValue) {
-            case 1:
-                controller.dateRangeLabel.setText("1 day");
-                controller.startDatePicker.setValue(LocalDate.now().minusDays(1));
-                controller.endDatePicker.setValue(LocalDate.now());
-                break;
-
-            case 2:
-                controller.dateRangeLabel.setText("2 days");
-                controller.startDatePicker.setValue(LocalDate.now().minusDays(2));
-                controller.endDatePicker.setValue(LocalDate.now());
-                break;
-
-            case 3:
-                controller.dateRangeLabel.setText("3 days");
-                controller.startDatePicker.setValue(LocalDate.now().minusDays(3));
-                controller.endDatePicker.setValue(LocalDate.now());
-                break;
-
-            case 4:
-                controller.dateRangeLabel.setText("1 week");
-                controller.startDatePicker.setValue(LocalDate.now().minusDays(7));
-                controller.endDatePicker.setValue(LocalDate.now());
-                break;
-
-            case 5:
-                controller.dateRangeLabel.setText("2 weeks");
-                controller.startDatePicker.setValue(LocalDate.now().minusDays(14));
-                controller.endDatePicker.setValue(LocalDate.now());
-                break;
-
-            case 6:
-                controller.dateRangeLabel.setText("1 month");
-                controller.startDatePicker.setValue(LocalDate.now().minusMonths(1));
-                controller.endDatePicker.setValue(LocalDate.now());
-                break;
-
-            case 7:
-                controller.dateRangeLabel.setText("2 months");
-                controller.startDatePicker.setValue(LocalDate.now().minusMonths(2));
-                controller.endDatePicker.setValue(LocalDate.now());
-                break;
-
-            case 8:
-                controller.dateRangeLabel.setText("3 months");
-                controller.startDatePicker.setValue(LocalDate.now().minusMonths(3));
-                controller.endDatePicker.setValue(LocalDate.now());
-                break;
-
-            case 9:
-                controller.dateRangeLabel.setText("6 months");
-                controller.startDatePicker.setValue(LocalDate.now().minusMonths(6));
-                controller.endDatePicker.setValue(LocalDate.now());
-                break;
-
-            case 10:
-                controller.dateRangeLabel.setText("1 year");
-                controller.startDatePicker.setValue(LocalDate.now().minusYears(1));
-                controller.endDatePicker.setValue(LocalDate.now());
-                break;
-
-            case 11:
-                controller.dateRangeLabel.setText("2 years");
-                controller.startDatePicker.setValue(LocalDate.now().minusYears(2));
-                controller.endDatePicker.setValue(LocalDate.now());
-                break;
-
-            case 12:
-                controller.dateRangeLabel.setText("3 years");
-                controller.startDatePicker.setValue(LocalDate.now().minusYears(3));
-                controller.endDatePicker.setValue(LocalDate.now());
-                break;
-
-            case 13:
-                controller.dateRangeLabel.setText("5 years");
-                controller.startDatePicker.setValue(LocalDate.now().minusYears(5));
-                controller.endDatePicker.setValue(LocalDate.now());
-                break;
-
-            case 14:
-                controller.dateRangeLabel.setText("10 years");
-                controller.startDatePicker.setValue(LocalDate.now().minusYears(10));
-                controller.endDatePicker.setValue(LocalDate.now());
-                break;
-
-            case 15:
-                controller.dateRangeLabel.setText("MAX");
-                controller.startDatePicker.setValue(LocalDate.now().minusYears(200));
-                controller.endDatePicker.setValue(LocalDate.now());
-                break;
-
-            default:
-                break;
-        }
+        StocksMonitorController.applyDateRange(
+                (int) controller.dateRangeSlider.getValue(),
+                controller.dateRangeLabel,
+                controller.startDatePicker,
+                controller.endDatePicker);
     }
 }
