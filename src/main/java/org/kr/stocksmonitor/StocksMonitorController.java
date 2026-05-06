@@ -10,12 +10,15 @@ import javafx.collections.ObservableList;
 import javafx.collections.transformation.FilteredList;
 import javafx.fxml.FXML;
 import javafx.fxml.Initializable;
+import javafx.geometry.Insets;
 import javafx.geometry.Pos;
 import javafx.scene.control.*;
 import javafx.scene.control.skin.ComboBoxListViewSkin;
 import javafx.scene.input.KeyCode;
 import javafx.scene.input.KeyEvent;
+import javafx.scene.layout.GridPane;
 import javafx.scene.layout.StackPane;
+import javafx.scene.layout.VBox;
 
 import java.net.*;
 
@@ -24,8 +27,10 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.kr.stocksmonitor.config.ConfigManager;
 import org.kr.stocksmonitor.utils.LogUtils;
+import org.kr.stocksmonitor.yahoo.HistoricalBar;
 import org.kr.stocksmonitor.yahoo.NewsItem;
 import org.kr.stocksmonitor.yahoo.QuoteItem;
+import org.kr.stocksmonitor.yahoo.QuoteSnapshot;
 import org.kr.stocksmonitor.yahoo.YahooAPI;
 
 import java.io.IOException;
@@ -54,10 +59,14 @@ public class StocksMonitorController implements Initializable {
         return t;
     });
     private final AtomicReference<ScheduledFuture<?>> pendingSearch = new AtomicReference<>();
+    private final AtomicReference<ScheduledFuture<?>> pendingHistoryReload = new AtomicReference<>();
     private final AtomicBoolean suppressQuoteAction = new AtomicBoolean(false);
     private final AtomicLong newsRequestId = new AtomicLong();
+    private final AtomicLong dataRequestId = new AtomicLong();
+    private final AtomicLong historyRequestId = new AtomicLong();
     private static final DateTimeFormatter NEWS_DATE_FORMAT =
             DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm").withZone(ZoneId.systemDefault());
+    private static final DateTimeFormatter HIST_DATE_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd");
     public DatePicker yahooStartDatePicker;
     public DatePicker yahooEndDatePicker;
     public Slider yahooDateRangeSlider;
@@ -82,6 +91,8 @@ public class StocksMonitorController implements Initializable {
         yahooDateRangeSlider.setValue(1);
         setDatePickersBasedOnSlider();
         yahooDateRangeSlider.valueProperty().addListener((_, _, _) -> setDatePickersBasedOnSlider());
+        yahooStartDatePicker.valueProperty().addListener((_, _, _) -> scheduleHistoryReload());
+        yahooEndDatePicker.valueProperty().addListener((_, _, _) -> scheduleHistoryReload());
     }
 
     private void initYahoooTableView() {
@@ -93,7 +104,9 @@ public class StocksMonitorController implements Initializable {
 
         loadFavoriteQuotes();
         tabPaneData.getSelectionModel().selectedItemProperty().addListener((_, _, newValue) -> {
-            if (newValue.equals(tabNews)) handleTabNewsSelection();
+            if (newValue == tabNews) handleTabNewsSelection();
+            else if (newValue == tabData) handleTabDataSelection();
+            else if (newValue == tabHistory) handleTabHistorySelection();
         });
         setYahooTableFavoriteQuotesColumns();
     }
@@ -151,9 +164,10 @@ public class StocksMonitorController implements Initializable {
 
     private void handleSelectedQuotes(List<QuoteItem> selectedQuotes) {
         log.debug(selectedQuotes);
-        if (tabPaneData.getSelectionModel().getSelectedItem() == tabNews) {
-            loadNewsForSelection(selectedQuotes);
-        }
+        Tab active = tabPaneData.getSelectionModel().getSelectedItem();
+        if (active == tabNews) loadNewsForSelection(selectedQuotes);
+        else if (active == tabData) loadDataForSelection(selectedQuotes);
+        else if (active == tabHistory) loadHistoryForSelection(selectedQuotes);
     }
 
     private void handleTabNewsSelection() {
@@ -161,22 +175,235 @@ public class StocksMonitorController implements Initializable {
         loadNewsForSelection(yahooTableFavoriteQuotes.getSelectionModel().getSelectedItems());
     }
 
-    private void loadNewsForSelection(List<QuoteItem> selected) {
-        if (selected == null || selected.isEmpty()) {
-            showNewsMessage("Select a ticker to see news");
+    private void handleTabDataSelection() {
+        log.debug("handleTabDataSelection()");
+        loadDataForSelection(yahooTableFavoriteQuotes.getSelectionModel().getSelectedItems());
+    }
+
+    private void handleTabHistorySelection() {
+        log.debug("handleTabHistorySelection()");
+        loadHistoryForSelection(yahooTableFavoriteQuotes.getSelectionModel().getSelectedItems());
+    }
+
+    private void scheduleHistoryReload() {
+        ScheduledFuture<?> prev = pendingHistoryReload.getAndSet(null);
+        if (prev != null) prev.cancel(false);
+        ScheduledFuture<?> future = debounceExecutor.schedule(
+                () -> Platform.runLater(() -> {
+                    if (tabPaneData.getSelectionModel().getSelectedItem() == tabHistory) {
+                        loadHistoryForSelection(yahooTableFavoriteQuotes.getSelectionModel().getSelectedItems());
+                    }
+                }),
+                250, TimeUnit.MILLISECONDS);
+        pendingHistoryReload.set(future);
+    }
+
+    private void loadDataForSelection(List<QuoteItem> selected) {
+        final List<String> symbols = symbolsOf(selected);
+        if (symbols.isEmpty()) {
+            showTabMessage(tabData, "Select a ticker to see today's data");
             return;
         }
-        // Snapshot the symbols — selectedItems is observable and may mutate before the worker runs.
-        final List<String> symbols = selected.stream()
+        showTabMessage(tabData, "Loading data...");
+        final long requestId = dataRequestId.incrementAndGet();
+        executorService.submit(() -> {
+            Instant start = Instant.now();
+            List<QuoteSnapshot> snapshots = new ArrayList<>(symbols.size());
+            for (String symbol : symbols) {
+                try {
+                    QuoteSnapshot snap = YahooAPI.getInstance().getSnapshot(symbol);
+                    if (snap != null) snapshots.add(snap);
+                } catch (IOException e) {
+                    log.error("Error fetching snapshot for {}", symbol, e);
+                }
+            }
+            Platform.runLater(() -> {
+                if (requestId != dataRequestId.get()) return;
+                renderData(snapshots);
+            });
+            LogUtils.debugDuration(log, start, "loading yahoo snapshots");
+        });
+    }
+
+    private void loadHistoryForSelection(List<QuoteItem> selected) {
+        final List<String> symbols = symbolsOf(selected);
+        if (symbols.isEmpty()) {
+            showTabMessage(tabHistory, "Select a ticker to see history");
+            return;
+        }
+        final LocalDate from = yahooStartDatePicker.getValue();
+        final LocalDate to = yahooEndDatePicker.getValue();
+        if (from == null || to == null || from.isAfter(to)) {
+            showTabMessage(tabHistory, "Pick a valid start/end date");
+            return;
+        }
+        showTabMessage(tabHistory, "Loading history...");
+        final long requestId = historyRequestId.incrementAndGet();
+        executorService.submit(() -> {
+            Instant start = Instant.now();
+            List<HistoricalBar> bars = new ArrayList<>();
+            for (String symbol : symbols) {
+                try {
+                    bars.addAll(YahooAPI.getInstance().getHistory(symbol, from, to));
+                } catch (IOException e) {
+                    log.error("Error fetching history for {} {}..{}", symbol, from, to, e);
+                }
+            }
+            bars.sort(Comparator.comparing(HistoricalBar::date).reversed()
+                    .thenComparing(HistoricalBar::symbol));
+            Platform.runLater(() -> {
+                if (requestId != historyRequestId.get()) return;
+                renderHistory(bars);
+            });
+            LogUtils.debugDuration(log, start, "loading yahoo history");
+        });
+    }
+
+    private static List<String> symbolsOf(List<QuoteItem> selected) {
+        if (selected == null || selected.isEmpty()) return List.of();
+        return selected.stream()
                 .map(QuoteItem::getSymbol)
                 .filter(s -> s != null && !s.isEmpty())
                 .distinct()
                 .toList();
-        if (symbols.isEmpty()) {
-            showNewsMessage("Select a ticker to see news");
+    }
+
+    private void showTabMessage(Tab tab, String text) {
+        Label label = new Label(text);
+        label.setStyle("-fx-font-size: 14;");
+        label.setMaxWidth(Double.MAX_VALUE);
+        label.setMaxHeight(Double.MAX_VALUE);
+        label.setAlignment(Pos.CENTER);
+        tab.setContent(new StackPane(label));
+    }
+
+    private void renderData(List<QuoteSnapshot> snapshots) {
+        if (snapshots.isEmpty()) {
+            showTabMessage(tabData, "No data found");
             return;
         }
-        showNewsMessage("Loading news...");
+        VBox root = new VBox(20);
+        root.setPadding(new Insets(15));
+        for (int i = 0; i < snapshots.size(); i++) {
+            if (i > 0) root.getChildren().add(new Separator());
+            root.getChildren().add(buildSnapshotForm(snapshots.get(i)));
+        }
+        ScrollPane scroll = new ScrollPane(root);
+        scroll.setFitToWidth(true);
+        tabData.setContent(scroll);
+    }
+
+    private static VBox buildSnapshotForm(QuoteSnapshot s) {
+        Label header = new Label(s.symbol() + (s.longName().isEmpty() ? "" : " — " + s.longName()));
+        header.setStyle("-fx-font-size: 16; -fx-font-weight: bold;");
+
+        GridPane grid = new GridPane();
+        grid.setHgap(10);
+        grid.setVgap(6);
+
+        int row = 0;
+        addReadOnlyField(grid, row++, "Symbol",     s.symbol());
+        addReadOnlyField(grid, row++, "Name",       s.longName());
+        addReadOnlyField(grid, row++, "Price",      formatPrice(s.regularMarketPrice()));
+        addReadOnlyField(grid, row++, "Change",     formatPrice(s.change()));
+        addReadOnlyField(grid, row++, "Change %",   formatPercent(s.changePercent()));
+        addReadOnlyField(grid, row++, "Day High",   formatPrice(s.regularMarketDayHigh()));
+        addReadOnlyField(grid, row++, "Day Low",    formatPrice(s.regularMarketDayLow()));
+        addReadOnlyField(grid, row++, "Prev Close", formatPrice(s.previousClose()));
+        addReadOnlyField(grid, row++, "Volume",     formatVolume(s.regularMarketVolume()));
+        addReadOnlyField(grid, row++, "52w High",   formatPrice(s.fiftyTwoWeekHigh()));
+        addReadOnlyField(grid, row++, "52w Low",    formatPrice(s.fiftyTwoWeekLow()));
+        addReadOnlyField(grid, row++, "Currency",   s.currency());
+        addReadOnlyField(grid, row++, "Exchange",   s.exchangeName());
+        addReadOnlyField(grid, row,   "As Of",      formatPublishTime(s.regularMarketTime()));
+
+        VBox box = new VBox(8, header, grid);
+        return box;
+    }
+
+    private static void addReadOnlyField(GridPane grid, int row, String labelText, String value) {
+        Label label = new Label(labelText + ":");
+        label.setStyle("-fx-font-weight: bold;");
+        TextField field = new TextField(value == null ? "" : value);
+        field.setEditable(false);
+        field.setFocusTraversable(false);
+        field.setPrefWidth(280);
+        grid.add(label, 0, row);
+        grid.add(field, 1, row);
+    }
+
+    private static String formatPrice(double v) {
+        return Double.isNaN(v) ? "" : String.format(Locale.ROOT, "%,.2f", v);
+    }
+
+    private static String formatPercent(double v) {
+        return Double.isNaN(v) ? "" : String.format(Locale.ROOT, "%+.2f%%", v);
+    }
+
+    private static String formatVolume(long v) {
+        return v == 0L ? "" : String.format(Locale.ROOT, "%,d", v);
+    }
+
+    private void renderHistory(List<HistoricalBar> bars) {
+        if (bars.isEmpty()) {
+            showTabMessage(tabHistory, "No history found for the selected range");
+            return;
+        }
+        TableView<HistoricalBar> table = new TableView<>();
+        table.getColumns().add(strCol("Symbol", HistoricalBar::symbol, 80));
+        table.getColumns().add(strCol("Date", b -> HIST_DATE_FORMAT.format(b.date()), 100));
+        table.getColumns().add(numCol("Open", HistoricalBar::open, 100));
+        table.getColumns().add(numCol("High", HistoricalBar::high, 100));
+        table.getColumns().add(numCol("Low", HistoricalBar::low, 100));
+        table.getColumns().add(numCol("Close", HistoricalBar::close, 100));
+        table.getColumns().add(numCol("Adj Close", HistoricalBar::adjClose, 100));
+        table.getColumns().add(longCol("Volume", HistoricalBar::volume, 120));
+
+        table.getItems().setAll(bars);
+        table.setColumnResizePolicy(TableView.CONSTRAINED_RESIZE_POLICY_ALL_COLUMNS);
+        tabHistory.setContent(new StackPane(table));
+    }
+
+    private static <T> TableColumn<T, String> strCol(String title, java.util.function.Function<T, String> getter, double width) {
+        TableColumn<T, String> col = new TableColumn<>(title);
+        col.setCellValueFactory(d -> Bindings.createStringBinding(() -> {
+            String v = getter.apply(d.getValue());
+            return v == null ? "" : v;
+        }));
+        col.setPrefWidth(width);
+        return col;
+    }
+
+    private static <T> TableColumn<T, String> numCol(String title, java.util.function.ToDoubleFunction<T> getter, double width) {
+        TableColumn<T, String> col = new TableColumn<>(title);
+        col.setCellValueFactory(d -> Bindings.createStringBinding(() -> {
+            double v = getter.applyAsDouble(d.getValue());
+            return Double.isNaN(v) ? "" : String.format(Locale.ROOT, "%,.2f", v);
+        }));
+        col.setPrefWidth(width);
+        col.setStyle("-fx-alignment: CENTER-RIGHT;");
+        return col;
+    }
+
+    private static <T> TableColumn<T, String> longCol(String title, java.util.function.ToLongFunction<T> getter, double width) {
+        TableColumn<T, String> col = new TableColumn<>(title);
+        col.setCellValueFactory(d -> Bindings.createStringBinding(() -> {
+            long v = getter.applyAsLong(d.getValue());
+            return v == 0L ? "" : String.format(Locale.ROOT, "%,d", v);
+        }));
+        col.setPrefWidth(width);
+        col.setStyle("-fx-alignment: CENTER-RIGHT;");
+        return col;
+    }
+
+    private void loadNewsForSelection(List<QuoteItem> selected) {
+        // Snapshot the symbols — selectedItems is observable and may mutate before the worker runs.
+        final List<String> symbols = symbolsOf(selected);
+        if (symbols.isEmpty()) {
+            showTabMessage(tabNews, "Select a ticker to see news");
+            return;
+        }
+        showTabMessage(tabNews, "Loading news...");
         final long requestId = newsRequestId.incrementAndGet();
         executorService.submit(() -> {
             Instant start = Instant.now();
@@ -202,18 +429,9 @@ public class StocksMonitorController implements Initializable {
         });
     }
 
-    private void showNewsMessage(String text) {
-        Label label = new Label(text);
-        label.setStyle("-fx-font-size: 14;");
-        label.setMaxWidth(Double.MAX_VALUE);
-        label.setMaxHeight(Double.MAX_VALUE);
-        label.setAlignment(Pos.CENTER);
-        tabNews.setContent(new StackPane(label));
-    }
-
     private void renderNews(List<NewsItem> news) {
         if (news.isEmpty()) {
-            showNewsMessage("No news found");
+            showTabMessage(tabNews, "No news found");
             return;
         }
 
@@ -416,6 +634,8 @@ public class StocksMonitorController implements Initializable {
     }
 
     @FXML protected Tab tabNews;
+    @FXML protected Tab tabData;
+    @FXML protected Tab tabHistory;
     @FXML protected TabPane tabPaneData;
     @FXML protected ComboBox<QuoteItem> cbxYahooQuote;
 }

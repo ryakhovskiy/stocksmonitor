@@ -38,10 +38,16 @@ public class RestUtils2 {
     }
 
     public String runQuery(String url, NameValuePair... parameters) throws IOException {
+        return runQuery(url, true, parameters);
+    }
+
+    public String runQuery(String url, boolean useCache, NameValuePair... parameters) throws IOException {
         Instant start = Instant.now();
-        final String key = String.format("%s, %s", url, Arrays.toString(parameters));
-        final String cacheHit = cache.get(key);
-        if (null != cacheHit) return cacheHit;
+        final String key = useCache ? String.format("%s, %s", url, Arrays.toString(parameters)) : null;
+        if (useCache) {
+            final String cacheHit = cache.get(key);
+            if (null != cacheHit) return cacheHit;
+        }
         try {
             final ClassicHttpRequest httpGet = ClassicRequestBuilder
                     .get(url)
@@ -51,7 +57,7 @@ public class RestUtils2 {
                 log.debug("Response: {} - {}", classicHttpResponse.getCode(), classicHttpResponse.getReasonPhrase());
                 return EntityUtils.toString(classicHttpResponse.getEntity());
             });
-            cache.putIfAbsent(key, result);
+            if (useCache) cache.putIfAbsent(key, result);
             return result;
         } finally {
             LogUtils.debugDuration(log, start, "Calling url");
