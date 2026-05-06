@@ -21,6 +21,8 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.NavigableMap;
+import java.util.TreeMap;
 
 public class YahooAPI {
 
@@ -52,6 +54,7 @@ public class YahooAPI {
     private final Map<String, List<NewsItem>> newsCache = Collections.synchronizedMap(new LRUMap<>(2000));
     private final Map<String, List<HistoricalBar>> historyCache = Collections.synchronizedMap(new LRUMap<>(2000));
     private final Map<String, List<Dividend>> dividendCache = Collections.synchronizedMap(new LRUMap<>(2000));
+    private final Map<String, NavigableMap<LocalDate, Double>> fxCache = Collections.synchronizedMap(new LRUMap<>(1000));
 
     public static YahooAPI getInstance() {
         return instance;
@@ -145,6 +148,7 @@ public class YahooAPI {
         JSONObject result = firstChartResult(response, symbol);
         if (result == null || !result.has("timestamp")) return Collections.emptyList();
 
+        String currency = currencyOf(result);
         JSONArray timestamps = result.getJSONArray("timestamp");
         JSONObject indicators = result.getJSONObject("indicators");
         JSONObject quote = indicators.getJSONArray("quote").getJSONObject(0);
@@ -164,6 +168,7 @@ public class YahooAPI {
             LocalDate date = Instant.ofEpochSecond(ts).atZone(zone).toLocalDate();
             bars.add(new HistoricalBar(
                     symbol,
+                    currency,
                     date,
                     doubleAt(opens, i),
                     doubleAt(highs, i),
@@ -197,6 +202,7 @@ public class YahooAPI {
         JSONObject result = firstChartResult(response, symbol);
         if (result == null) return Collections.emptyList();
 
+        String currency = currencyOf(result);
         // Yahoo omits 'events' / 'events.dividends' when no payouts fall in the range — that's a real "no data" answer, cache it.
         JSONObject events = result.optJSONObject("events");
         JSONObject dividends = events == null ? null : events.optJSONObject("dividends");
@@ -216,11 +222,64 @@ public class YahooAPI {
             double amount = d.optDouble("amount", Double.NaN);
             if (Double.isNaN(amount)) continue;
             LocalDate date = Instant.ofEpochSecond(ts).atZone(zone).toLocalDate();
-            bars.add(new Dividend(symbol, date, amount));
+            bars.add(new Dividend(symbol, currency, date, amount));
         }
         bars.sort(Comparator.comparing(Dividend::date));
         dividendCache.putIfAbsent(key, bars);
         return bars;
+    }
+
+    public NavigableMap<LocalDate, Double> getFxRates(String fromCcy, String toCcy, LocalDate from, LocalDate to) throws IOException {
+        if (fromCcy == null || fromCcy.isEmpty() || toCcy == null || toCcy.isEmpty()) {
+            return Collections.emptyNavigableMap();
+        }
+        if (fromCcy.equalsIgnoreCase(toCcy)) {
+            return Collections.emptyNavigableMap(); // caller treats empty/missing as 1.0
+        }
+        if (from == null || to == null || from.isAfter(to)) {
+            return Collections.emptyNavigableMap();
+        }
+        final String pair = (fromCcy + toCcy).toUpperCase() + "=X";
+        final String key = pair + "|" + from + "|" + to;
+        NavigableMap<LocalDate, Double> cached = fxCache.get(key);
+        if (cached != null) return cached;
+
+        final ZoneId zone = ZoneId.systemDefault();
+        long period1 = from.atStartOfDay(zone).toEpochSecond();
+        long period2 = to.plusDays(1).atStartOfDay(zone).toEpochSecond();
+        final String url = CHART_BASE_URL + URLEncoder.encode(pair, StandardCharsets.UTF_8);
+        final NameValuePair[] parameters = {
+                new BasicNameValuePair("period1", Long.toString(period1)),
+                new BasicNameValuePair("period2", Long.toString(period2)),
+                new BasicNameValuePair("interval", "1d")
+        };
+        String response = RestUtils.getInstance().runQuery(url, parameters);
+        JSONObject result = firstChartResult(response, pair);
+        if (result == null || !result.has("timestamp")) {
+            // 404 / error / no data — cache an empty map so we don't retry on every render.
+            fxCache.putIfAbsent(key, Collections.emptyNavigableMap());
+            return Collections.emptyNavigableMap();
+        }
+
+        JSONArray timestamps = result.getJSONArray("timestamp");
+        JSONObject indicators = result.getJSONObject("indicators");
+        JSONObject quote = indicators.getJSONArray("quote").getJSONObject(0);
+        JSONArray closes = quote.optJSONArray("close");
+
+        NavigableMap<LocalDate, Double> rates = new TreeMap<>();
+        for (int i = 0; i < timestamps.length(); i++) {
+            double rate = doubleAt(closes, i);
+            if (Double.isNaN(rate) || rate <= 0.0) continue;
+            LocalDate date = Instant.ofEpochSecond(timestamps.getLong(i)).atZone(zone).toLocalDate();
+            rates.put(date, rate);
+        }
+        fxCache.putIfAbsent(key, rates);
+        return rates;
+    }
+
+    private static String currencyOf(JSONObject chartResult) {
+        JSONObject meta = chartResult.optJSONObject("meta");
+        return meta == null ? "" : meta.optString("currency", "");
     }
 
     private static JSONObject firstChartResult(String response, String symbol) {

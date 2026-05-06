@@ -50,7 +50,9 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.ToDoubleFunction;
 import java.util.function.UnaryOperator;
+import java.util.stream.Collectors;
 
 public class StocksMonitorController implements Initializable {
 
@@ -73,11 +75,21 @@ public class StocksMonitorController implements Initializable {
     private final AtomicLong historyRequestId = new AtomicLong();
     private final AtomicLong chartRequestId = new AtomicLong();
     private final AtomicLong dividendRequestId = new AtomicLong();
+
+    public enum TargetCurrency { Native, USD, EUR }
+    private TargetCurrency targetCurrency = TargetCurrency.Native;
     private static final int DEFAULT_HISTORY_DAYS = 365;
     private static final int DEFAULT_SLIDER_POSITION = 10; // matches "1 year" in applyDateRange
     private static final DateTimeFormatter NEWS_DATE_FORMAT =
             DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm").withZone(ZoneId.systemDefault());
     private static final DateTimeFormatter HIST_DATE_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd");
+
+    // Chart colour scheme
+    private static final String PRICE_LINE_STYLE    = "-fx-stroke: #87CEFA; -fx-stroke-width: 1.5px;";
+    private static final String PRICE_DOT_DEFAULT   = "-fx-background-color: #87CEFA; -fx-background-radius: 2px; -fx-padding: 2px;";
+    private static final String PRICE_DOT_HOVER     = "-fx-background-color: #87CEFA; -fx-background-radius: 5px; -fx-padding: 5px;";
+    private static final String DIV_DOT_DEFAULT     = "-fx-background-color: #28a745, white; -fx-background-insets: 0, 2; -fx-background-radius: 5px; -fx-padding: 5px;";
+    private static final String DIV_DOT_HOVER       = "-fx-background-color: #28a745, white; -fx-background-insets: 0, 2; -fx-background-radius: 7px; -fx-padding: 7px;";
     public DatePicker yahooStartDatePicker;
     public DatePicker yahooEndDatePicker;
     public Slider yahooDateRangeSlider;
@@ -96,6 +108,21 @@ public class StocksMonitorController implements Initializable {
         initYahoooSymbolsCombobox();
         initYahoooTableView();
         initDatePickers();
+        initCurrencyCombobox();
+    }
+
+    private void initCurrencyCombobox() {
+        cbxCurrency.setItems(FXCollections.observableArrayList(TargetCurrency.values()));
+        cbxCurrency.getSelectionModel().select(TargetCurrency.Native);
+        cbxCurrency.valueProperty().addListener((_, _, newValue) -> {
+            if (newValue == null) return;
+            targetCurrency = newValue;
+            refreshCurrentTab();
+        });
+    }
+
+    private void refreshCurrentTab() {
+        handleSelectedQuotes(yahooTableFavoriteQuotes.getSelectionModel().getSelectedItems());
     }
 
     private void initDatePickers() {
@@ -249,9 +276,14 @@ public class StocksMonitorController implements Initializable {
                     log.error("Error fetching snapshot for {}", symbol, e);
                 }
             }
+            // Snapshot is "now" data; pull a small recent FX window so floorEntry can resolve weekend dates.
+            LocalDate today = LocalDate.now();
+            LocalDate fxFrom = today.minusDays(7);
+            Set<String> currencies = snapshots.stream().map(QuoteSnapshot::currency).collect(Collectors.toSet());
+            FxConverter converter = buildConverter(currencies, fxFrom, today);
             Platform.runLater(() -> {
                 if (requestId != dataRequestId.get()) return;
-                renderData(snapshots);
+                renderData(snapshots, converter);
             });
             LogUtils.debugDuration(log, start, "loading yahoo snapshots");
         });
@@ -274,22 +306,36 @@ public class StocksMonitorController implements Initializable {
         executorService.submit(() -> {
             Instant start = Instant.now();
             LinkedHashMap<String, List<HistoricalBar>> bySymbol = new LinkedHashMap<>();
+            LinkedHashMap<String, List<Dividend>> divsBySymbol = new LinkedHashMap<>();
             for (String symbol : symbols) {
                 try {
                     bySymbol.put(symbol, YahooAPI.getInstance().getHistory(symbol, from, to));
                 } catch (IOException e) {
                     log.error("Error fetching history for {} {}..{}", symbol, from, to, e);
                 }
+                try {
+                    divsBySymbol.put(symbol, YahooAPI.getInstance().getDividends(symbol, from, to));
+                } catch (IOException e) {
+                    log.error("Error fetching dividends for {} {}..{}", symbol, from, to, e);
+                    divsBySymbol.put(symbol, List.of());
+                }
             }
+            Set<String> currencies = bySymbol.values().stream()
+                    .flatMap(List::stream)
+                    .map(HistoricalBar::currency)
+                    .collect(Collectors.toSet());
+            FxConverter converter = buildConverter(currencies, from, to);
             Platform.runLater(() -> {
                 if (requestId != chartRequestId.get()) return;
-                renderChart(bySymbol);
+                renderChart(bySymbol, divsBySymbol, converter);
             });
             LogUtils.debugDuration(log, start, "loading yahoo chart");
         });
     }
 
-    private void renderChart(Map<String, List<HistoricalBar>> bySymbol) {
+    private void renderChart(Map<String, List<HistoricalBar>> bySymbol,
+                             Map<String, List<Dividend>> divsBySymbol,
+                             FxConverter conv) {
         NumberAxis xAxis = new NumberAxis();
         xAxis.setLabel("Date");
         xAxis.setForceZeroInRange(false);
@@ -300,7 +346,18 @@ public class StocksMonitorController implements Initializable {
             @Override public Number fromString(String s) { return null; }
         });
         NumberAxis yAxis = new NumberAxis();
-        yAxis.setLabel("Close");
+        // Y-axis label: in Native mode show "Close" or "Close (mixed)" if we have >1 native currency.
+        Set<String> nativeCcys = bySymbol.values().stream()
+                .flatMap(List::stream)
+                .map(HistoricalBar::currency)
+                .filter(c -> c != null && !c.isEmpty())
+                .collect(Collectors.toSet());
+        String yLabel;
+        if (conv != null) yLabel = "Close (" + conv.target() + ")";
+        else if (nativeCcys.size() == 1) yLabel = "Close (" + nativeCcys.iterator().next() + ")";
+        else if (nativeCcys.size() > 1) yLabel = "Close (mixed)";
+        else yLabel = "Close";
+        yAxis.setLabel(yLabel);
         yAxis.setForceZeroInRange(false);
 
         LineChart<Number, Number> chart = new LineChart<>(xAxis, yAxis);
@@ -310,17 +367,85 @@ public class StocksMonitorController implements Initializable {
         chart.setLegendVisible(bySymbol.size() > 1);
         chart.setAnimated(false);
 
+        // Per-symbol map of converted close prices, used to position dividend points on the price line.
+        Map<String, NavigableMap<LocalDate, Double>> closesBySymbol = new HashMap<>();
+        Map<String, NavigableMap<LocalDate, Double>> nativeClosesBySymbol = new HashMap<>();
+
         for (Map.Entry<String, List<HistoricalBar>> entry : bySymbol.entrySet()) {
             XYChart.Series<Number, Number> series = new XYChart.Series<>();
-            series.setName(entry.getKey());
+            // In Native mode with mixed currencies, append the per-series currency to the legend.
+            String seriesName = entry.getKey();
+            if (conv == null && nativeCcys.size() > 1 && !entry.getValue().isEmpty()) {
+                String c = entry.getValue().get(0).currency();
+                if (c != null && !c.isEmpty()) seriesName = entry.getKey() + " (" + c + ")";
+            }
+            series.setName(seriesName);
+            NavigableMap<LocalDate, Double> closes = new TreeMap<>();
+            NavigableMap<LocalDate, Double> nativeCloses = new TreeMap<>();
             for (HistoricalBar bar : entry.getValue()) {
                 if (Double.isNaN(bar.close())) continue;
-                series.getData().add(new XYChart.Data<>(bar.date().toEpochDay(), bar.close()));
+                double y = convertValue(conv, bar.close(), bar.currency(), bar.date());
+                series.getData().add(new XYChart.Data<>(bar.date().toEpochDay(), y));
+                closes.put(bar.date(), y);
+                nativeCloses.put(bar.date(), bar.close());
             }
+            closesBySymbol.put(entry.getKey(), closes);
+            nativeClosesBySymbol.put(entry.getKey(), nativeCloses);
             if (series.getData().isEmpty()) continue;
             chart.getData().add(series);
+            // Style the price line light-blue (overrides JavaFX default series colour).
+            Node priceLineNode = series.getNode();
+            if (priceLineNode != null) priceLineNode.setStyle(PRICE_LINE_STYLE);
             // Symbol Nodes are created when the series is added; attach tooltips after.
-            attachPointTooltips(series);
+            attachPointTooltips(series, conv == null ? null : conv.target());
+        }
+
+        // Overlay dividend points per ticker: red dots positioned on the price line at each div date.
+        for (Map.Entry<String, List<Dividend>> entry : divsBySymbol.entrySet()) {
+            String ticker = entry.getKey();
+            List<Dividend> dividends = entry.getValue();
+            if (dividends == null || dividends.isEmpty()) continue;
+            NavigableMap<LocalDate, Double> closes = closesBySymbol.get(ticker);
+            NavigableMap<LocalDate, Double> nativeCloses = nativeClosesBySymbol.get(ticker);
+            if (closes == null || closes.isEmpty()) continue;
+
+            XYChart.Series<Number, Number> divSeries = new XYChart.Series<>();
+            divSeries.setName(ticker + " · dividend");
+
+            // Snapshot the per-point data (date, amount, displayCurrency, yieldPct) for the tooltip
+            // attachment phase, since once added to the chart the Data nodes are looked up by index.
+            List<DividendPoint> tipData = new ArrayList<>();
+            for (Dividend div : dividends) {
+                Double yPrice = closes.get(div.date());
+                if (yPrice == null) {
+                    Map.Entry<LocalDate, Double> e = closes.floorEntry(div.date());
+                    if (e == null) e = closes.firstEntry();
+                    yPrice = e == null ? null : e.getValue();
+                }
+                if (yPrice == null) continue;
+                Double nPrice = nativeCloses.get(div.date());
+                if (nPrice == null) {
+                    Map.Entry<LocalDate, Double> e = nativeCloses.floorEntry(div.date());
+                    if (e == null) e = nativeCloses.firstEntry();
+                    nPrice = e == null ? null : e.getValue();
+                }
+                double yieldPct = (nPrice == null || nPrice == 0.0 || Double.isNaN(div.amount()))
+                        ? Double.NaN
+                        : div.amount() / nPrice * 100.0;
+                double displayAmount = convertValue(conv, div.amount(), div.currency(), div.date());
+                String displayCcy = currencyDisplay(conv, div.currency());
+
+                divSeries.getData().add(new XYChart.Data<>(div.date().toEpochDay(), yPrice));
+                tipData.add(new DividendPoint(ticker, div.date(), displayAmount, displayCcy, yieldPct));
+            }
+
+            if (divSeries.getData().isEmpty()) continue;
+            chart.getData().add(divSeries);
+            // Hide the connecting line — we want dots only, not a red zigzag.
+            Node lineNode = divSeries.getNode();
+            if (lineNode != null) lineNode.setStyle("-fx-stroke: transparent;");
+            // Style each data point as a red marker and attach a hover tooltip.
+            attachDividendTooltips(divSeries, tipData);
         }
 
         if (chart.getData().isEmpty()) {
@@ -330,25 +455,63 @@ public class StocksMonitorController implements Initializable {
         tabChart.setContent(new StackPane(chart));
     }
 
-    private static void attachPointTooltips(XYChart.Series<Number, Number> series) {
-        final String symbol = series.getName();
-        for (XYChart.Data<Number, Number> data : series.getData()) {
-            Node node = data.getNode();
+    private record DividendPoint(String symbol, LocalDate date, double displayAmount,
+                                 String displayCurrency, double yieldPct) {}
+
+    private static void attachDividendTooltips(XYChart.Series<Number, Number> series,
+                                               List<DividendPoint> tipData) {
+        var data = series.getData();
+        for (int i = 0; i < data.size() && i < tipData.size(); i++) {
+            Node node = data.get(i).getNode();
             if (node == null) continue;
-            LocalDate date = LocalDate.ofEpochDay(data.getXValue().longValue());
-            double price = data.getYValue().doubleValue();
-            String tipText = String.format("%s%n%s%nClose: %s",
-                    symbol,
-                    date.format(HIST_DATE_FORMAT),
-                    String.format(Locale.ROOT, "%,.2f", price));
+            DividendPoint p = tipData.get(i);
+            String amountStr = Double.isNaN(p.displayAmount())
+                    ? ""
+                    : String.format(Locale.ROOT, "%,.4f %s", p.displayAmount(),
+                            p.displayCurrency() == null ? "" : p.displayCurrency()).trim();
+            String yieldStr = Double.isNaN(p.yieldPct())
+                    ? ""
+                    : String.format(Locale.ROOT, "%.3f%%", p.yieldPct());
+            String tipText = String.format("%s%nDividend%n%s%nAmount: %s%nYield:  %s",
+                    p.symbol(),
+                    p.date().format(HIST_DATE_FORMAT),
+                    amountStr,
+                    yieldStr);
             Tooltip tip = new Tooltip(tipText);
             tip.setShowDelay(Duration.millis(50));
             tip.setHideDelay(Duration.millis(200));
             Tooltip.install(node, tip);
             node.setCursor(Cursor.HAND);
-            // Enlarge the marker on hover so the hovered point stands out from the line.
-            node.setOnMouseEntered(_ -> node.setStyle("-fx-background-radius: 6px; -fx-padding: 6px;"));
-            node.setOnMouseExited(_ -> node.setStyle(""));
+            // Default styling: solid red marker with white inner ring (10px diameter).
+            String defaultStyle = DIV_DOT_DEFAULT;
+            String hoverStyle   = DIV_DOT_HOVER;
+            node.setStyle(defaultStyle);
+            node.setOnMouseEntered(_ -> node.setStyle(hoverStyle));
+            node.setOnMouseExited(_ -> node.setStyle(defaultStyle));
+        }
+    }
+
+    private static void attachPointTooltips(XYChart.Series<Number, Number> series, String currencySuffix) {
+        final String header = series.getName();
+        final String suffix = (currencySuffix == null || currencySuffix.isEmpty()) ? "" : " " + currencySuffix;
+        for (XYChart.Data<Number, Number> data : series.getData()) {
+            Node node = data.getNode();
+            if (node == null) continue;
+            LocalDate date = LocalDate.ofEpochDay(data.getXValue().longValue());
+            double price = data.getYValue().doubleValue();
+            String tipText = String.format("%s%n%s%nClose: %s%s",
+                    header,
+                    date.format(HIST_DATE_FORMAT),
+                    String.format(Locale.ROOT, "%,.2f", price),
+                    suffix);
+            Tooltip tip = new Tooltip(tipText);
+            tip.setShowDelay(Duration.millis(50));
+            tip.setHideDelay(Duration.millis(200));
+            Tooltip.install(node, tip);
+            node.setCursor(Cursor.HAND);
+            node.setStyle(PRICE_DOT_DEFAULT);
+            node.setOnMouseEntered(_ -> node.setStyle(PRICE_DOT_HOVER));
+            node.setOnMouseExited(_ -> node.setStyle(PRICE_DOT_DEFAULT));
         }
     }
 
@@ -378,9 +541,11 @@ public class StocksMonitorController implements Initializable {
             }
             bars.sort(Comparator.comparing(HistoricalBar::date).reversed()
                     .thenComparing(HistoricalBar::symbol));
+            Set<String> currencies = bars.stream().map(HistoricalBar::currency).collect(Collectors.toSet());
+            FxConverter converter = buildConverter(currencies, from, to);
             Platform.runLater(() -> {
                 if (requestId != historyRequestId.get()) return;
-                renderHistory(bars);
+                renderHistory(bars, converter);
             });
             LogUtils.debugDuration(log, start, "loading yahoo history");
         });
@@ -403,36 +568,89 @@ public class StocksMonitorController implements Initializable {
         executorService.submit(() -> {
             Instant start = Instant.now();
             List<Dividend> dividends = new ArrayList<>();
+            // Build per-symbol native close map so we can compute yield = amount / close * 100.
+            // Yield is FX-invariant (same rate cancels in num and denom), so we use native closes.
+            Map<String, NavigableMap<LocalDate, Double>> nativeCloseBySymbol = new HashMap<>();
             for (String symbol : symbols) {
                 try {
                     dividends.addAll(YahooAPI.getInstance().getDividends(symbol, from, to));
                 } catch (IOException e) {
                     log.error("Error fetching dividends for {} {}..{}", symbol, from, to, e);
                 }
+                try {
+                    NavigableMap<LocalDate, Double> closes = new TreeMap<>();
+                    for (HistoricalBar bar : YahooAPI.getInstance().getHistory(symbol, from, to)) {
+                        if (!Double.isNaN(bar.close())) closes.put(bar.date(), bar.close());
+                    }
+                    nativeCloseBySymbol.put(symbol, closes);
+                } catch (IOException e) {
+                    log.error("Error fetching history for yield calc {} {}..{}", symbol, from, to, e);
+                    nativeCloseBySymbol.put(symbol, new TreeMap<>());
+                }
             }
             dividends.sort(Comparator.comparing(Dividend::date).reversed()
                     .thenComparing(Dividend::symbol));
+            Set<String> currencies = dividends.stream().map(Dividend::currency).collect(Collectors.toSet());
+            FxConverter converter = buildConverter(currencies, from, to);
             Platform.runLater(() -> {
                 if (requestId != dividendRequestId.get()) return;
-                renderDividend(dividends);
+                renderDividend(dividends, converter, nativeCloseBySymbol);
             });
             LogUtils.debugDuration(log, start, "loading yahoo dividends");
         });
     }
 
-    private void renderDividend(List<Dividend> dividends) {
+    private void renderDividend(List<Dividend> dividends,
+                                FxConverter conv,
+                                Map<String, NavigableMap<LocalDate, Double>> nativeCloseBySymbol) {
         if (dividends.isEmpty()) {
             showTabMessage(tabDividend, "No dividends found for the selected range");
             return;
         }
         TableView<Dividend> table = new TableView<>();
         table.getColumns().add(strCol("Symbol", Dividend::symbol, 100));
-        table.getColumns().add(strCol("Date", d -> HIST_DATE_FORMAT.format(d.date()), 120));
-        table.getColumns().add(numCol("Amount", Dividend::amount, 120));
+        table.getColumns().add(strCol("Date",   d -> HIST_DATE_FORMAT.format(d.date()), 120));
+
+        TableColumn<Dividend, String> amountCol = new TableColumn<>("Amount");
+        amountCol.setCellValueFactory(d -> Bindings.createStringBinding(() -> {
+            Dividend div = d.getValue();
+            double v = convertValue(conv, div.amount(), div.currency(), div.date());
+            return Double.isNaN(v) ? "" : String.format(Locale.ROOT, "%,.2f", v);
+        }));
+        amountCol.setPrefWidth(120);
+        amountCol.setStyle("-fx-alignment: CENTER-RIGHT;");
+        table.getColumns().add(amountCol);
+
+        TableColumn<Dividend, String> yieldCol = new TableColumn<>("Yield %");
+        yieldCol.setCellValueFactory(d -> Bindings.createStringBinding(() -> {
+            Dividend div = d.getValue();
+            double y = computeYieldPercent(div, nativeCloseBySymbol);
+            return Double.isNaN(y) ? "" : String.format(Locale.ROOT, "%.3f%%", y);
+        }));
+        yieldCol.setPrefWidth(100);
+        yieldCol.setStyle("-fx-alignment: CENTER-RIGHT;");
+        table.getColumns().add(yieldCol);
+
+        table.getColumns().add(strCol("Currency", d -> currencyDisplay(conv, d.currency()), 80));
 
         table.getItems().setAll(dividends);
         table.setColumnResizePolicy(TableView.CONSTRAINED_RESIZE_POLICY_ALL_COLUMNS);
         tabDividend.setContent(new StackPane(table));
+    }
+
+    private static double computeYieldPercent(Dividend div,
+                                              Map<String, NavigableMap<LocalDate, Double>> nativeCloseBySymbol) {
+        if (Double.isNaN(div.amount())) return Double.NaN;
+        NavigableMap<LocalDate, Double> closes = nativeCloseBySymbol.get(div.symbol());
+        if (closes == null || closes.isEmpty()) return Double.NaN;
+        Double price = closes.get(div.date());
+        if (price == null) {
+            Map.Entry<LocalDate, Double> e = closes.floorEntry(div.date());
+            if (e == null) e = closes.firstEntry();
+            price = e == null ? null : e.getValue();
+        }
+        if (price == null || price == 0.0) return Double.NaN;
+        return div.amount() / price * 100.0;
     }
 
     private static List<String> symbolsOf(List<QuoteItem> selected) {
@@ -453,7 +671,7 @@ public class StocksMonitorController implements Initializable {
         tab.setContent(new StackPane(label));
     }
 
-    private void renderData(List<QuoteSnapshot> snapshots) {
+    private void renderData(List<QuoteSnapshot> snapshots, FxConverter conv) {
         if (snapshots.isEmpty()) {
             showTabMessage(tabData, "No data found");
             return;
@@ -462,14 +680,14 @@ public class StocksMonitorController implements Initializable {
         root.setPadding(new Insets(15));
         for (int i = 0; i < snapshots.size(); i++) {
             if (i > 0) root.getChildren().add(new Separator());
-            root.getChildren().add(buildSnapshotForm(snapshots.get(i)));
+            root.getChildren().add(buildSnapshotForm(snapshots.get(i), conv));
         }
         ScrollPane scroll = new ScrollPane(root);
         scroll.setFitToWidth(true);
         tabData.setContent(scroll);
     }
 
-    private static VBox buildSnapshotForm(QuoteSnapshot s) {
+    private VBox buildSnapshotForm(QuoteSnapshot s, FxConverter conv) {
         Label header = new Label(s.symbol() + (s.longName().isEmpty() ? "" : " — " + s.longName()));
         header.setStyle("-fx-font-size: 16; -fx-font-weight: bold;");
 
@@ -477,24 +695,29 @@ public class StocksMonitorController implements Initializable {
         grid.setHgap(10);
         grid.setVgap(6);
 
+        // For snapshot conversion use the snapshot's regularMarketTime date (today for live data).
+        LocalDate snapDate = s.regularMarketTime().equals(Instant.EPOCH)
+                ? LocalDate.now()
+                : s.regularMarketTime().atZone(ZoneId.systemDefault()).toLocalDate();
+        ToDoubleFunction<Double> conv1 = v -> convertValue(conv, v, s.currency(), snapDate);
+
         int row = 0;
         addReadOnlyField(grid, row++, "Symbol",     s.symbol());
         addReadOnlyField(grid, row++, "Name",       s.longName());
-        addReadOnlyField(grid, row++, "Price",      formatPrice(s.regularMarketPrice()));
-        addReadOnlyField(grid, row++, "Change",     formatPrice(s.change()));
-        addReadOnlyField(grid, row++, "Change %",   formatPercent(s.changePercent()));
-        addReadOnlyField(grid, row++, "Day High",   formatPrice(s.regularMarketDayHigh()));
-        addReadOnlyField(grid, row++, "Day Low",    formatPrice(s.regularMarketDayLow()));
-        addReadOnlyField(grid, row++, "Prev Close", formatPrice(s.previousClose()));
-        addReadOnlyField(grid, row++, "Volume",     formatVolume(s.regularMarketVolume()));
-        addReadOnlyField(grid, row++, "52w High",   formatPrice(s.fiftyTwoWeekHigh()));
-        addReadOnlyField(grid, row++, "52w Low",    formatPrice(s.fiftyTwoWeekLow()));
-        addReadOnlyField(grid, row++, "Currency",   s.currency());
+        addReadOnlyField(grid, row++, "Price",      formatPrice(conv1.applyAsDouble(s.regularMarketPrice())));
+        addReadOnlyField(grid, row++, "Change",     formatPrice(conv1.applyAsDouble(s.change())));
+        addReadOnlyField(grid, row++, "Change %",   formatPercent(s.changePercent())); // unit-less
+        addReadOnlyField(grid, row++, "Day High",   formatPrice(conv1.applyAsDouble(s.regularMarketDayHigh())));
+        addReadOnlyField(grid, row++, "Day Low",    formatPrice(conv1.applyAsDouble(s.regularMarketDayLow())));
+        addReadOnlyField(grid, row++, "Prev Close", formatPrice(conv1.applyAsDouble(s.previousClose())));
+        addReadOnlyField(grid, row++, "Volume",     formatVolume(s.regularMarketVolume())); // un-converted
+        addReadOnlyField(grid, row++, "52w High",   formatPrice(conv1.applyAsDouble(s.fiftyTwoWeekHigh())));
+        addReadOnlyField(grid, row++, "52w Low",    formatPrice(conv1.applyAsDouble(s.fiftyTwoWeekLow())));
+        addReadOnlyField(grid, row++, "Currency",   currencyDisplay(conv, s.currency()));
         addReadOnlyField(grid, row++, "Exchange",   s.exchangeName());
         addReadOnlyField(grid, row,   "As Of",      formatPublishTime(s.regularMarketTime()));
 
-        VBox box = new VBox(8, header, grid);
-        return box;
+        return new VBox(8, header, grid);
     }
 
     private static void addReadOnlyField(GridPane grid, int row, String labelText, String value) {
@@ -506,6 +729,51 @@ public class StocksMonitorController implements Initializable {
         field.setPrefWidth(280);
         grid.add(label, 0, row);
         grid.add(field, 1, row);
+    }
+
+    /**
+     * Currency conversion plan for one render. {@code target} is null in Native mode.
+     * {@code rates.get(nativeCcy)} returns the FX series mapping {@code date -> nativeCcy/target}.
+     * Edge case note: Yahoo's `GBp` / `ZAc` / `ILA` (sub-unit currencies) are NOT normalized to
+     * their main unit here; values from those tickers will under-convert by 100x. Use Native mode
+     * for those listings.
+     */
+    private record FxConverter(String target,
+                               Map<String, java.util.NavigableMap<LocalDate, Double>> rates) {
+        double convert(double value, String nativeCcy, LocalDate date) {
+            if (Double.isNaN(value)) return value;
+            if (target == null || nativeCcy == null || nativeCcy.isEmpty()
+                    || target.equalsIgnoreCase(nativeCcy)) return value;
+            java.util.NavigableMap<LocalDate, Double> series = rates.get(nativeCcy);
+            if (series == null || series.isEmpty()) return value;
+            Map.Entry<LocalDate, Double> e = series.floorEntry(date);
+            if (e == null) e = series.firstEntry();
+            return value * e.getValue();
+        }
+    }
+
+    private FxConverter buildConverter(Set<String> nativeCurrencies, LocalDate from, LocalDate to) {
+        if (targetCurrency == TargetCurrency.Native) return null;
+        final String target = targetCurrency.name();
+        Map<String, java.util.NavigableMap<LocalDate, Double>> rates = new HashMap<>();
+        for (String c : nativeCurrencies) {
+            if (c == null || c.isEmpty() || c.equalsIgnoreCase(target)) continue;
+            try {
+                rates.put(c, YahooAPI.getInstance().getFxRates(c, target, from, to));
+            } catch (IOException e) {
+                log.error("Error loading FX {}->{}", c, target, e);
+            }
+        }
+        return new FxConverter(target, rates);
+    }
+
+    private String currencyDisplay(FxConverter conv, String nativeCcy) {
+        if (conv == null) return nativeCcy == null ? "" : nativeCcy;
+        return conv.target();
+    }
+
+    private double convertValue(FxConverter conv, double value, String nativeCcy, LocalDate date) {
+        return conv == null ? value : conv.convert(value, nativeCcy, date);
     }
 
     private static String formatPrice(double v) {
@@ -520,24 +788,39 @@ public class StocksMonitorController implements Initializable {
         return v == 0L ? "" : String.format(Locale.ROOT, "%,d", v);
     }
 
-    private void renderHistory(List<HistoricalBar> bars) {
+    private void renderHistory(List<HistoricalBar> bars, FxConverter conv) {
         if (bars.isEmpty()) {
             showTabMessage(tabHistory, "No history found for the selected range");
             return;
         }
         TableView<HistoricalBar> table = new TableView<>();
-        table.getColumns().add(strCol("Symbol", HistoricalBar::symbol, 80));
-        table.getColumns().add(strCol("Date", b -> HIST_DATE_FORMAT.format(b.date()), 100));
-        table.getColumns().add(numCol("Open", HistoricalBar::open, 100));
-        table.getColumns().add(numCol("High", HistoricalBar::high, 100));
-        table.getColumns().add(numCol("Low", HistoricalBar::low, 100));
-        table.getColumns().add(numCol("Close", HistoricalBar::close, 100));
-        table.getColumns().add(numCol("Adj Close", HistoricalBar::adjClose, 100));
+        table.getColumns().add(strCol("Symbol",   HistoricalBar::symbol, 80));
+        table.getColumns().add(strCol("Date",     b -> HIST_DATE_FORMAT.format(b.date()), 100));
+        table.getColumns().add(numConvCol("Open",      HistoricalBar::open,     conv, 100));
+        table.getColumns().add(numConvCol("High",      HistoricalBar::high,     conv, 100));
+        table.getColumns().add(numConvCol("Low",       HistoricalBar::low,      conv, 100));
+        table.getColumns().add(numConvCol("Close",     HistoricalBar::close,    conv, 100));
+        table.getColumns().add(numConvCol("Adj Close", HistoricalBar::adjClose, conv, 100));
         table.getColumns().add(longCol("Volume", HistoricalBar::volume, 120));
+        table.getColumns().add(strCol("Currency", b -> currencyDisplay(conv, b.currency()), 80));
 
         table.getItems().setAll(bars);
         table.setColumnResizePolicy(TableView.CONSTRAINED_RESIZE_POLICY_ALL_COLUMNS);
         tabHistory.setContent(new StackPane(table));
+    }
+
+    private TableColumn<HistoricalBar, String> numConvCol(String title,
+                                                          ToDoubleFunction<HistoricalBar> getter,
+                                                          FxConverter conv, double width) {
+        TableColumn<HistoricalBar, String> col = new TableColumn<>(title);
+        col.setCellValueFactory(d -> Bindings.createStringBinding(() -> {
+            HistoricalBar b = d.getValue();
+            double v = convertValue(conv, getter.applyAsDouble(b), b.currency(), b.date());
+            return Double.isNaN(v) ? "" : String.format(Locale.ROOT, "%,.2f", v);
+        }));
+        col.setPrefWidth(width);
+        col.setStyle("-fx-alignment: CENTER-RIGHT;");
+        return col;
     }
 
     private static <T> TableColumn<T, String> strCol(String title, java.util.function.Function<T, String> getter, double width) {
@@ -816,4 +1099,5 @@ public class StocksMonitorController implements Initializable {
     @FXML protected Tab tabDividend;
     @FXML protected TabPane tabPaneData;
     @FXML protected ComboBox<QuoteItem> cbxYahooQuote;
+    @FXML protected ComboBox<TargetCurrency> cbxCurrency;
 }

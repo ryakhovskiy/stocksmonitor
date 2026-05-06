@@ -25,6 +25,8 @@
                                     <children>
                                         <Label layoutX="14.0" layoutY="14.0" text="Ticker" AnchorPane.leftAnchor="14.0" AnchorPane.topAnchor="14.0" />
                                         <ComboBox fx:id="cbxYahooQuote" editable="true" layoutX="67.0" layoutY="10.0" prefHeight="25.0" prefWidth="627.0" promptText="Look for symbol..." AnchorPane.leftAnchor="67.0" AnchorPane.rightAnchor="269.0" AnchorPane.topAnchor="10.0" />
+                                        <Label layoutX="14.0" layoutY="48.0" text="Currency" AnchorPane.leftAnchor="14.0" AnchorPane.topAnchor="48.0" />
+                                        <ComboBox fx:id="cbxCurrency" layoutX="67.0" layoutY="44.0" prefHeight="25.0" prefWidth="200.0" AnchorPane.leftAnchor="67.0" AnchorPane.topAnchor="44.0" />
                                         <Label layoutX="728.0" layoutY="18.0" text="Start" AnchorPane.rightAnchor="210.0" AnchorPane.topAnchor="18.0" />
                                         <DatePicker fx:id="yahooStartDatePicker" layoutX="758.0" layoutY="14.0" prefHeight="25.0" prefWidth="176.0" AnchorPane.rightAnchor="20.0" AnchorPane.topAnchor="14.0" />
                                         <Label layoutX="728.0" layoutY="46.0" text="End" AnchorPane.rightAnchor="210.0" AnchorPane.topAnchor="46.0" />
