@@ -61,6 +61,6 @@ build/
 
 ### VS Code ###
 .vscode/
-
+*.claude
 ### Mac OS ###
 .DS_Store

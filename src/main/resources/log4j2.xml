@@ -11,6 +11,5 @@
         </Root>
         <Logger name="org.apache" level="INFO" />
         <Logger name="org.apache.logging.log4j" level="OFF" />
-        <Logger name="org.htmlunit" level="INFO" />
     </Loggers>
 </Configuration>

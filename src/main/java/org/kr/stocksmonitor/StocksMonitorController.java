@@ -3,16 +3,19 @@ package org.kr.stocksmonitor;
 import javafx.application.HostServices;
 import javafx.application.Platform;
 import javafx.beans.binding.Bindings;
+import javafx.beans.property.ReadOnlyObjectWrapper;
 import javafx.collections.FXCollections;
 import javafx.collections.ListChangeListener;
 import javafx.collections.ObservableList;
 import javafx.collections.transformation.FilteredList;
 import javafx.fxml.FXML;
 import javafx.fxml.Initializable;
+import javafx.geometry.Pos;
 import javafx.scene.control.*;
 import javafx.scene.control.skin.ComboBoxListViewSkin;
 import javafx.scene.input.KeyCode;
 import javafx.scene.input.KeyEvent;
+import javafx.scene.layout.StackPane;
 
 import java.net.*;
 
@@ -20,25 +23,41 @@ import javafx.util.StringConverter;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.kr.stocksmonitor.config.ConfigManager;
-import org.kr.stocksmonitor.polygon.Ticker;
 import org.kr.stocksmonitor.utils.LogUtils;
+import org.kr.stocksmonitor.yahoo.NewsItem;
 import org.kr.stocksmonitor.yahoo.QuoteItem;
 import org.kr.stocksmonitor.yahoo.YahooAPI;
 
 import java.io.IOException;
 import java.time.Instant;
 import java.time.LocalDate;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.UnaryOperator;
 
 public class StocksMonitorController implements Initializable {
 
     private static final Logger log = LogManager.getLogger(StocksMonitorController.class);
-    protected static final ExecutorService executorService = Executors.newFixedThreadPool(16);
-    private final ScheduledExecutorService debounceExecutor = Executors.newSingleThreadScheduledExecutor();
+    protected static final ExecutorService executorService = Executors.newFixedThreadPool(16, r -> {
+        Thread t = new Thread(r, "stocksmonitor-worker");
+        t.setDaemon(true);
+        return t;
+    });
+    private final ScheduledExecutorService debounceExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "stocksmonitor-debounce");
+        t.setDaemon(true);
+        return t;
+    });
     private final AtomicReference<ScheduledFuture<?>> pendingSearch = new AtomicReference<>();
+    private final AtomicBoolean suppressQuoteAction = new AtomicBoolean(false);
+    private final AtomicLong newsRequestId = new AtomicLong();
+    private static final DateTimeFormatter NEWS_DATE_FORMAT =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm").withZone(ZoneId.systemDefault());
     public DatePicker yahooStartDatePicker;
     public DatePicker yahooEndDatePicker;
     public Slider yahooDateRangeSlider;
@@ -73,7 +92,7 @@ public class StocksMonitorController implements Initializable {
         });
 
         loadFavoriteQuotes();
-        tabPaneData.getSelectionModel().selectedItemProperty().addListener((_, oldValue, newValue) -> {
+        tabPaneData.getSelectionModel().selectedItemProperty().addListener((_, _, newValue) -> {
             if (newValue.equals(tabNews)) handleTabNewsSelection();
         });
         setYahooTableFavoriteQuotesColumns();
@@ -132,11 +151,123 @@ public class StocksMonitorController implements Initializable {
 
     private void handleSelectedQuotes(List<QuoteItem> selectedQuotes) {
         log.debug(selectedQuotes);
-
+        if (tabPaneData.getSelectionModel().getSelectedItem() == tabNews) {
+            loadNewsForSelection(selectedQuotes);
+        }
     }
 
     private void handleTabNewsSelection() {
         log.debug("handleTabNewsSelection()");
+        loadNewsForSelection(yahooTableFavoriteQuotes.getSelectionModel().getSelectedItems());
+    }
+
+    private void loadNewsForSelection(List<QuoteItem> selected) {
+        if (selected == null || selected.isEmpty()) {
+            showNewsMessage("Select a ticker to see news");
+            return;
+        }
+        // Snapshot the symbols — selectedItems is observable and may mutate before the worker runs.
+        final List<String> symbols = selected.stream()
+                .map(QuoteItem::getSymbol)
+                .filter(s -> s != null && !s.isEmpty())
+                .distinct()
+                .toList();
+        if (symbols.isEmpty()) {
+            showNewsMessage("Select a ticker to see news");
+            return;
+        }
+        showNewsMessage("Loading news...");
+        final long requestId = newsRequestId.incrementAndGet();
+        executorService.submit(() -> {
+            Instant start = Instant.now();
+            // LinkedHashMap dedups by uuid while preserving insertion order across symbols.
+            Map<String, NewsItem> dedup = new LinkedHashMap<>();
+            for (String symbol : symbols) {
+                try {
+                    for (NewsItem item : YahooAPI.getInstance().getNews(symbol)) {
+                        if (!item.uuid().isEmpty()) dedup.putIfAbsent(item.uuid(), item);
+                        else dedup.putIfAbsent(item.link(), item);
+                    }
+                } catch (IOException e) {
+                    log.error("Error fetching news for {}", symbol, e);
+                }
+            }
+            List<NewsItem> news = new ArrayList<>(dedup.values());
+            news.sort(Comparator.comparing(NewsItem::publishTime).reversed());
+            Platform.runLater(() -> {
+                if (requestId != newsRequestId.get()) return; // a newer request superseded us
+                renderNews(news);
+            });
+            LogUtils.debugDuration(log, start, "loading yahoo news");
+        });
+    }
+
+    private void showNewsMessage(String text) {
+        Label label = new Label(text);
+        label.setStyle("-fx-font-size: 14;");
+        label.setMaxWidth(Double.MAX_VALUE);
+        label.setMaxHeight(Double.MAX_VALUE);
+        label.setAlignment(Pos.CENTER);
+        tabNews.setContent(new StackPane(label));
+    }
+
+    private void renderNews(List<NewsItem> news) {
+        if (news.isEmpty()) {
+            showNewsMessage("No news found");
+            return;
+        }
+
+        TableView<NewsItem> table = new TableView<>();
+
+        TableColumn<NewsItem, String> dateCol = new TableColumn<>("Published");
+        dateCol.setCellValueFactory(d -> Bindings.createStringBinding(() -> formatPublishTime(d.getValue().publishTime())));
+        dateCol.setPrefWidth(140);
+
+        TableColumn<NewsItem, String> publisherCol = new TableColumn<>("Publisher");
+        publisherCol.setCellValueFactory(d -> Bindings.createStringBinding(() -> d.getValue().publisher()));
+        publisherCol.setPrefWidth(160);
+
+        TableColumn<NewsItem, NewsItem> titleCol = new TableColumn<>("Title");
+        titleCol.setCellValueFactory(d -> new ReadOnlyObjectWrapper<>(d.getValue()));
+        titleCol.setCellFactory(_ -> new TableCell<>() {
+            private final Hyperlink link = new Hyperlink();
+            {
+                link.setOnAction(_ -> {
+                    NewsItem item = getItem();
+                    if (item != null && hostServices != null && !item.link().isEmpty()) {
+                        hostServices.showDocument(item.link());
+                    }
+                });
+                link.setWrapText(true);
+            }
+
+            @Override
+            protected void updateItem(NewsItem item, boolean empty) {
+                super.updateItem(item, empty);
+                if (empty || item == null) {
+                    setGraphic(null);
+                } else {
+                    link.setText(item.title());
+                    setGraphic(link);
+                    setWrapText(true);
+                }
+            }
+        });
+        titleCol.setPrefWidth(560);
+
+        TableColumn<NewsItem, String> tickersCol = new TableColumn<>("Tickers");
+        tickersCol.setCellValueFactory(d -> Bindings.createStringBinding(() -> String.join(", ", d.getValue().relatedTickers())));
+        tickersCol.setPrefWidth(120);
+
+        table.getColumns().addAll(dateCol, publisherCol, titleCol, tickersCol);
+        table.getItems().setAll(news);
+        table.setColumnResizePolicy(TableView.CONSTRAINED_RESIZE_POLICY_ALL_COLUMNS);
+        tabNews.setContent(new StackPane(table));
+    }
+
+    private static String formatPublishTime(Instant t) {
+        if (t == null || t.equals(Instant.EPOCH)) return "";
+        return NEWS_DATE_FORMAT.format(t);
     }
 
     private void loadFavoriteQuotes() {
@@ -148,7 +279,7 @@ public class StocksMonitorController implements Initializable {
     }
 
     private void initYahoooSymbolsCombobox() {
-        ComboBoxListViewSkin skin = new ComboBoxListViewSkin(cbxYahooQuote);
+        ComboBoxListViewSkin<QuoteItem> skin = new ComboBoxListViewSkin<>(cbxYahooQuote);
         skin.getPopupContent().addEventFilter(KeyEvent.ANY, e -> {
             if (e.getCode() == KeyCode.UNDEFINED) {
                 log.debug("initYahoooTickersCombobox() {}", e);
@@ -162,10 +293,11 @@ public class StocksMonitorController implements Initializable {
         cbxYahooQuote.setSkin(skin);
         cbxYahooQuote.setEditable(true);
 
-        cbxYahooQuote.getEditor().textProperty().addListener((_, _, newValue) -> {
-            reloadYahooTickerCombobox(newValue);
-        });
+        cbxYahooQuote.getEditor().textProperty().addListener((_, _, newValue) -> reloadYahooTickerCombobox(newValue));
         cbxYahooQuote.setOnAction(_ -> {
+            if (suppressQuoteAction.get()) return;
+            // Only treat this as a real selection if the dropdown is open (user picked from the list).
+            if (!cbxYahooQuote.isShowing()) return;
             final Object value = cbxYahooQuote.getSelectionModel().getSelectedItem();
             log.debug("selected: {}", value);
             if (!(value instanceof QuoteItem selected))
@@ -224,7 +356,7 @@ public class StocksMonitorController implements Initializable {
         cbxYahooQuote.getEditor().setTextFormatter(textFormatter);
 
         // Set up string converter for correct display
-        cbxYahooQuote.setConverter(new StringConverter<QuoteItem>() {
+        cbxYahooQuote.setConverter(new StringConverter<>() {
             @Override
             public String toString(QuoteItem o) {
                 if (o == null) return null;
@@ -236,30 +368,24 @@ public class StocksMonitorController implements Initializable {
             public QuoteItem fromString(String string) { return null; }
         });
 
-        // Bind the filtered list to the ComboBox's items
-        cbxYahooQuote.setItems(filteredData);
-        cbxYahooQuote.hide();
-        cbxYahooQuote.setVisibleRowCount(filteredData.size());
-        cbxYahooQuote.show();
+        // Suppress the action handler while we swap items — setItems can clear/change the value
+        // and would otherwise fire setOnAction with a stale selection.
+        suppressQuoteAction.set(true);
+        try {
+            cbxYahooQuote.setItems(filteredData);
+            cbxYahooQuote.hide();
+            cbxYahooQuote.setVisibleRowCount(filteredData.size());
+            cbxYahooQuote.show();
+        } finally {
+            suppressQuoteAction.set(false);
+        }
     }
-    
+
     public void shutdown() throws IOException {
         log.debug("shutting down the controller");
-        executorService.shutdown();
-        debounceExecutor.shutdown();
-        var favoriteQuotes = yahooTableFavoriteQuotes.getItems();
-        ConfigManager.getInstance().saveFavoriteQuotes(favoriteQuotes);
-    }
-
-    protected void showAlert(Exception e, String header) {
-        showAlert("Error", e.getMessage(), Arrays.toString(e.getStackTrace()));
-    }
-
-    protected void showAlert(String header, String message, String content) {
-        Alert errorAlert = new Alert(Alert.AlertType.ERROR);
-        errorAlert.setHeaderText(header + ": " + message);
-        errorAlert.setContentText(content);
-        errorAlert.showAndWait();
+        debounceExecutor.shutdownNow();
+        executorService.shutdownNow();
+        ConfigManager.getInstance().saveFavoriteQuotes(yahooTableFavoriteQuotes.getItems());
     }
 
     private void setDatePickersBasedOnSlider() {
@@ -292,19 +418,4 @@ public class StocksMonitorController implements Initializable {
     @FXML protected Tab tabNews;
     @FXML protected TabPane tabPaneData;
     @FXML protected ComboBox<QuoteItem> cbxYahooQuote;
-
-
-    //polygon controls
-    @FXML protected PasswordField tfApiKey;
-    @FXML protected ComboBox<Ticker> cbxTicker;
-    @FXML protected TableView<Ticker> tblTickers;
-    @FXML protected DatePicker startDatePicker;
-    @FXML protected DatePicker endDatePicker;
-    @FXML protected Slider dateRangeSlider;
-    @FXML protected Label dateRangeLabel;
-    @FXML protected Label progressLabel;
-    @FXML protected Tab tabSettings;
-    @FXML protected ProgressIndicator progressIndicator;
-    @FXML protected ChoiceBox<String> cbxAssetClass;
-    @FXML protected ComboBox<String> cbxTickerType;
 }
