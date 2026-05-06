@@ -12,6 +12,9 @@ import javafx.fxml.FXML;
 import javafx.fxml.Initializable;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
+import javafx.scene.chart.LineChart;
+import javafx.scene.chart.NumberAxis;
+import javafx.scene.chart.XYChart;
 import javafx.scene.control.*;
 import javafx.scene.control.skin.ComboBoxListViewSkin;
 import javafx.scene.input.KeyCode;
@@ -59,11 +62,14 @@ public class StocksMonitorController implements Initializable {
         return t;
     });
     private final AtomicReference<ScheduledFuture<?>> pendingSearch = new AtomicReference<>();
-    private final AtomicReference<ScheduledFuture<?>> pendingHistoryReload = new AtomicReference<>();
+    private final AtomicReference<ScheduledFuture<?>> pendingDateReload = new AtomicReference<>();
     private final AtomicBoolean suppressQuoteAction = new AtomicBoolean(false);
     private final AtomicLong newsRequestId = new AtomicLong();
     private final AtomicLong dataRequestId = new AtomicLong();
     private final AtomicLong historyRequestId = new AtomicLong();
+    private final AtomicLong chartRequestId = new AtomicLong();
+    private static final int DEFAULT_HISTORY_DAYS = 365;
+    private static final int DEFAULT_SLIDER_POSITION = 10; // matches "1 year" in applyDateRange
     private static final DateTimeFormatter NEWS_DATE_FORMAT =
             DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm").withZone(ZoneId.systemDefault());
     private static final DateTimeFormatter HIST_DATE_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd");
@@ -88,11 +94,16 @@ public class StocksMonitorController implements Initializable {
     }
 
     private void initDatePickers() {
-        yahooDateRangeSlider.setValue(1);
-        setDatePickersBasedOnSlider();
+        // Default to the last 365 days. Set values BEFORE attaching listeners so
+        // the slider listener doesn't override the explicit minusDays(365) bound.
+        LocalDate today = LocalDate.now();
+        yahooStartDatePicker.setValue(today.minusDays(DEFAULT_HISTORY_DAYS));
+        yahooEndDatePicker.setValue(today);
+        yahooDateRangeLabel.setText("1 year");
+        yahooDateRangeSlider.setValue(DEFAULT_SLIDER_POSITION);
         yahooDateRangeSlider.valueProperty().addListener((_, _, _) -> setDatePickersBasedOnSlider());
-        yahooStartDatePicker.valueProperty().addListener((_, _, _) -> scheduleHistoryReload());
-        yahooEndDatePicker.valueProperty().addListener((_, _, _) -> scheduleHistoryReload());
+        yahooStartDatePicker.valueProperty().addListener((_, _, _) -> scheduleDateDependentReload());
+        yahooEndDatePicker.valueProperty().addListener((_, _, _) -> scheduleDateDependentReload());
     }
 
     private void initYahoooTableView() {
@@ -107,6 +118,7 @@ public class StocksMonitorController implements Initializable {
             if (newValue == tabNews) handleTabNewsSelection();
             else if (newValue == tabData) handleTabDataSelection();
             else if (newValue == tabHistory) handleTabHistorySelection();
+            else if (newValue == tabChart) handleTabChartSelection();
         });
         setYahooTableFavoriteQuotesColumns();
     }
@@ -168,6 +180,7 @@ public class StocksMonitorController implements Initializable {
         if (active == tabNews) loadNewsForSelection(selectedQuotes);
         else if (active == tabData) loadDataForSelection(selectedQuotes);
         else if (active == tabHistory) loadHistoryForSelection(selectedQuotes);
+        else if (active == tabChart) loadChartForSelection(selectedQuotes);
     }
 
     private void handleTabNewsSelection() {
@@ -185,17 +198,23 @@ public class StocksMonitorController implements Initializable {
         loadHistoryForSelection(yahooTableFavoriteQuotes.getSelectionModel().getSelectedItems());
     }
 
-    private void scheduleHistoryReload() {
-        ScheduledFuture<?> prev = pendingHistoryReload.getAndSet(null);
+    private void handleTabChartSelection() {
+        log.debug("handleTabChartSelection()");
+        loadChartForSelection(yahooTableFavoriteQuotes.getSelectionModel().getSelectedItems());
+    }
+
+    private void scheduleDateDependentReload() {
+        ScheduledFuture<?> prev = pendingDateReload.getAndSet(null);
         if (prev != null) prev.cancel(false);
         ScheduledFuture<?> future = debounceExecutor.schedule(
                 () -> Platform.runLater(() -> {
-                    if (tabPaneData.getSelectionModel().getSelectedItem() == tabHistory) {
-                        loadHistoryForSelection(yahooTableFavoriteQuotes.getSelectionModel().getSelectedItems());
-                    }
+                    Tab active = tabPaneData.getSelectionModel().getSelectedItem();
+                    List<QuoteItem> selected = yahooTableFavoriteQuotes.getSelectionModel().getSelectedItems();
+                    if (active == tabHistory) loadHistoryForSelection(selected);
+                    else if (active == tabChart) loadChartForSelection(selected);
                 }),
                 250, TimeUnit.MILLISECONDS);
-        pendingHistoryReload.set(future);
+        pendingDateReload.set(future);
     }
 
     private void loadDataForSelection(List<QuoteItem> selected) {
@@ -223,6 +242,75 @@ public class StocksMonitorController implements Initializable {
             });
             LogUtils.debugDuration(log, start, "loading yahoo snapshots");
         });
+    }
+
+    private void loadChartForSelection(List<QuoteItem> selected) {
+        final List<String> symbols = symbolsOf(selected);
+        if (symbols.isEmpty()) {
+            showTabMessage(tabChart, "Select a ticker to see the chart");
+            return;
+        }
+        final LocalDate from = yahooStartDatePicker.getValue();
+        final LocalDate to = yahooEndDatePicker.getValue();
+        if (from == null || to == null || from.isAfter(to)) {
+            showTabMessage(tabChart, "Pick a valid start/end date");
+            return;
+        }
+        showTabMessage(tabChart, "Loading chart...");
+        final long requestId = chartRequestId.incrementAndGet();
+        executorService.submit(() -> {
+            Instant start = Instant.now();
+            LinkedHashMap<String, List<HistoricalBar>> bySymbol = new LinkedHashMap<>();
+            for (String symbol : symbols) {
+                try {
+                    bySymbol.put(symbol, YahooAPI.getInstance().getHistory(symbol, from, to));
+                } catch (IOException e) {
+                    log.error("Error fetching history for {} {}..{}", symbol, from, to, e);
+                }
+            }
+            Platform.runLater(() -> {
+                if (requestId != chartRequestId.get()) return;
+                renderChart(bySymbol);
+            });
+            LogUtils.debugDuration(log, start, "loading yahoo chart");
+        });
+    }
+
+    private void renderChart(Map<String, List<HistoricalBar>> bySymbol) {
+        NumberAxis xAxis = new NumberAxis();
+        xAxis.setLabel("Date");
+        xAxis.setForceZeroInRange(false);
+        xAxis.setTickLabelFormatter(new StringConverter<>() {
+            @Override public String toString(Number n) {
+                return LocalDate.ofEpochDay(n.longValue()).format(HIST_DATE_FORMAT);
+            }
+            @Override public Number fromString(String s) { return null; }
+        });
+        NumberAxis yAxis = new NumberAxis();
+        yAxis.setLabel("Close");
+        yAxis.setForceZeroInRange(false);
+
+        LineChart<Number, Number> chart = new LineChart<>(xAxis, yAxis);
+        chart.setTitle("Close price");
+        chart.setCreateSymbols(false);
+        chart.setLegendVisible(bySymbol.size() > 1);
+        chart.setAnimated(false);
+
+        for (Map.Entry<String, List<HistoricalBar>> entry : bySymbol.entrySet()) {
+            XYChart.Series<Number, Number> series = new XYChart.Series<>();
+            series.setName(entry.getKey());
+            for (HistoricalBar bar : entry.getValue()) {
+                if (Double.isNaN(bar.close())) continue;
+                series.getData().add(new XYChart.Data<>(bar.date().toEpochDay(), bar.close()));
+            }
+            if (!series.getData().isEmpty()) chart.getData().add(series);
+        }
+
+        if (chart.getData().isEmpty()) {
+            showTabMessage(tabChart, "No history found for the selected range");
+            return;
+        }
+        tabChart.setContent(new StackPane(chart));
     }
 
     private void loadHistoryForSelection(List<QuoteItem> selected) {
@@ -636,6 +724,7 @@ public class StocksMonitorController implements Initializable {
     @FXML protected Tab tabNews;
     @FXML protected Tab tabData;
     @FXML protected Tab tabHistory;
+    @FXML protected Tab tabChart;
     @FXML protected TabPane tabPaneData;
     @FXML protected ComboBox<QuoteItem> cbxYahooQuote;
 }
