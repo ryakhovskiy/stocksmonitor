@@ -12,6 +12,8 @@ import javafx.fxml.FXML;
 import javafx.fxml.Initializable;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
+import javafx.scene.Cursor;
+import javafx.scene.Node;
 import javafx.scene.chart.LineChart;
 import javafx.scene.chart.NumberAxis;
 import javafx.scene.chart.XYChart;
@@ -22,6 +24,7 @@ import javafx.scene.input.KeyEvent;
 import javafx.scene.layout.GridPane;
 import javafx.scene.layout.StackPane;
 import javafx.scene.layout.VBox;
+import javafx.util.Duration;
 
 import java.net.*;
 
@@ -292,7 +295,8 @@ public class StocksMonitorController implements Initializable {
 
         LineChart<Number, Number> chart = new LineChart<>(xAxis, yAxis);
         chart.setTitle("Close price");
-        chart.setCreateSymbols(false);
+        // Symbols must be created so each data point has a Node to attach a tooltip to.
+        chart.setCreateSymbols(true);
         chart.setLegendVisible(bySymbol.size() > 1);
         chart.setAnimated(false);
 
@@ -303,7 +307,10 @@ public class StocksMonitorController implements Initializable {
                 if (Double.isNaN(bar.close())) continue;
                 series.getData().add(new XYChart.Data<>(bar.date().toEpochDay(), bar.close()));
             }
-            if (!series.getData().isEmpty()) chart.getData().add(series);
+            if (series.getData().isEmpty()) continue;
+            chart.getData().add(series);
+            // Symbol Nodes are created when the series is added; attach tooltips after.
+            attachPointTooltips(series);
         }
 
         if (chart.getData().isEmpty()) {
@@ -311,6 +318,28 @@ public class StocksMonitorController implements Initializable {
             return;
         }
         tabChart.setContent(new StackPane(chart));
+    }
+
+    private static void attachPointTooltips(XYChart.Series<Number, Number> series) {
+        final String symbol = series.getName();
+        for (XYChart.Data<Number, Number> data : series.getData()) {
+            Node node = data.getNode();
+            if (node == null) continue;
+            LocalDate date = LocalDate.ofEpochDay(data.getXValue().longValue());
+            double price = data.getYValue().doubleValue();
+            String tipText = String.format("%s%n%s%nClose: %s",
+                    symbol,
+                    date.format(HIST_DATE_FORMAT),
+                    String.format(Locale.ROOT, "%,.2f", price));
+            Tooltip tip = new Tooltip(tipText);
+            tip.setShowDelay(Duration.millis(50));
+            tip.setHideDelay(Duration.millis(200));
+            Tooltip.install(node, tip);
+            node.setCursor(Cursor.HAND);
+            // Enlarge the marker on hover so the hovered point stands out from the line.
+            node.setOnMouseEntered(_ -> node.setStyle("-fx-background-radius: 6px; -fx-padding: 6px;"));
+            node.setOnMouseExited(_ -> node.setStyle(""));
+        }
     }
 
     private void loadHistoryForSelection(List<QuoteItem> selected) {

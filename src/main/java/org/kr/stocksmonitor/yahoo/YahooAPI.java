@@ -7,7 +7,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.json.JSONArray;
 import org.json.JSONObject;
-import org.kr.stocksmonitor.utils.RestUtils2;
+import org.kr.stocksmonitor.utils.RestUtils;
 
 import java.io.IOException;
 import java.net.URLEncoder;
@@ -64,7 +64,7 @@ public class YahooAPI {
             return entry;
         final NameValuePair[] parameters = Arrays.copyOf(SEARCH_QUOTES_CONFIG_PARAMS, SEARCH_QUOTES_CONFIG_PARAMS.length);
         parameters[parameters.length - 1] = new BasicNameValuePair("q", name);
-        String response = RestUtils2.getInstance().runQuery(SEARCH_QUOTES_BASE_URL, parameters);
+        String response = RestUtils.getInstance().runQuery(SEARCH_QUOTES_BASE_URL, parameters);
         final JSONObject obj = new JSONObject(response);
         if (!obj.has("quotes")) {
             log.error("Response does not contain the 'quotes' object: {}", response);
@@ -93,7 +93,7 @@ public class YahooAPI {
                 new BasicNameValuePair("listsCount", "0"),
                 new BasicNameValuePair("enableFuzzyQuery", "false")
         };
-        String response = RestUtils2.getInstance().runQuery(SEARCH_QUOTES_BASE_URL, parameters);
+        String response = RestUtils.getInstance().runQuery(SEARCH_QUOTES_BASE_URL, parameters);
         final JSONObject obj = new JSONObject(response);
         if (!obj.has("news")) {
             log.error("Response does not contain the 'news' array: {}", response);
@@ -115,7 +115,7 @@ public class YahooAPI {
                 new BasicNameValuePair("interval", "1d"),
                 new BasicNameValuePair("range", "1d")
         };
-        String response = RestUtils2.getInstance().runQuery(url, false, parameters);
+        String response = RestUtils.getInstance().runQuery(url, false, parameters);
         JSONObject result = firstChartResult(response, symbol);
         if (result == null) return null;
         JSONObject meta = result.optJSONObject("meta");
@@ -139,7 +139,7 @@ public class YahooAPI {
                 new BasicNameValuePair("interval", "1d"),
                 new BasicNameValuePair("events", "history")
         };
-        String response = RestUtils2.getInstance().runQuery(url, parameters);
+        String response = RestUtils.getInstance().runQuery(url, parameters);
         JSONObject result = firstChartResult(response, symbol);
         if (result == null || !result.has("timestamp")) return Collections.emptyList();
 

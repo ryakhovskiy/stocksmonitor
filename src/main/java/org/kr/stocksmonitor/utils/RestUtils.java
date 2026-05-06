@@ -17,13 +17,13 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.Map;
 
-public class RestUtils2 {
+public class RestUtils {
 
-    private static final Logger log = LogManager.getLogger(RestUtils2.class);
+    private static final Logger log = LogManager.getLogger(RestUtils.class);
 
-    private static final RestUtils2 instance = new RestUtils2();
+    private static final RestUtils instance = new RestUtils();
 
-    public static RestUtils2 getInstance() {
+    public static RestUtils getInstance() {
         return instance;
     }
 
@@ -34,7 +34,7 @@ public class RestUtils2 {
             .build();
     private final Map<String, String> cache = Collections.synchronizedMap(new LRUMap<>(30000));
 
-    private RestUtils2() {
+    private RestUtils() {
     }
 
     public String runQuery(String url, NameValuePair... parameters) throws IOException {
