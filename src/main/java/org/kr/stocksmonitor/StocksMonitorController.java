@@ -21,9 +21,14 @@ import javafx.scene.control.*;
 import javafx.scene.control.skin.ComboBoxListViewSkin;
 import javafx.scene.input.KeyCode;
 import javafx.scene.input.KeyEvent;
+import javafx.scene.layout.FlowPane;
 import javafx.scene.layout.GridPane;
+import javafx.scene.layout.HBox;
+import javafx.scene.layout.Priority;
 import javafx.scene.layout.StackPane;
 import javafx.scene.layout.VBox;
+import javafx.scene.paint.Color;
+import javafx.scene.shape.Rectangle;
 import javafx.util.Duration;
 
 import java.net.*;
@@ -90,10 +95,14 @@ public class StocksMonitorController implements Initializable {
             DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm").withZone(ZoneId.systemDefault());
     private static final DateTimeFormatter HIST_DATE_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd");
 
-    // Chart colour scheme
-    private static final String PRICE_LINE_STYLE    = "-fx-stroke: #87CEFA; -fx-stroke-width: 1.5px;";
-    private static final String PRICE_DOT_DEFAULT   = "-fx-background-color: #87CEFA; -fx-background-radius: 2px; -fx-padding: 2px;";
-    private static final String PRICE_DOT_HOVER     = "-fx-background-color: #87CEFA; -fx-background-radius: 5px; -fx-padding: 5px;";
+    // Chart colour scheme — palette cycled per ticker so each line is distinct.
+    private static final String[] CHART_COLORS = {
+            "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+            "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"
+    };
+    private static String chartColor(int idx) {
+        return CHART_COLORS[Math.floorMod(idx, CHART_COLORS.length)];
+    }
     private static final String DIV_DOT_DEFAULT     = "-fx-background-color: #28a745, white; -fx-background-insets: 0, 2; -fx-background-radius: 5px; -fx-padding: 5px;";
     private static final String DIV_DOT_HOVER       = "-fx-background-color: #28a745, white; -fx-background-insets: 0, 2; -fx-background-radius: 7px; -fx-padding: 7px;";
     public DatePicker yahooStartDatePicker;
@@ -120,10 +129,34 @@ public class StocksMonitorController implements Initializable {
             initDatePickers(settings);
             initCurrencyCombobox(settings);
             initToolbarButtons();
+            restoreSelectedSymbols(settings);
             restoreLastTab(settings);
         } finally {
             restoringSettings.set(false);
         }
+        // After restoring, kick the active tab to load data for the restored selection.
+        // We do this on a fresh runLater so the favorites table's selection model has fully settled.
+        Platform.runLater(this::refreshCurrentTab);
+    }
+
+    private void restoreSelectedSymbols(ConfigManager.AppSettings settings) {
+        if (settings == null) return;
+        List<String> wanted = settings.selectedSymbols();
+        if (wanted == null || wanted.isEmpty()) return;
+        ObservableList<QuoteItem> items = yahooTableFavoriteQuotes.getItems();
+        Set<String> wantedSet = new HashSet<>(wanted);
+        List<Integer> indices = new ArrayList<>();
+        for (int i = 0; i < items.size(); i++) {
+            QuoteItem q = items.get(i);
+            if (q != null && q.getSymbol() != null && wantedSet.contains(q.getSymbol())) indices.add(i);
+        }
+        if (indices.isEmpty()) return;
+        var selModel = yahooTableFavoriteQuotes.getSelectionModel();
+        // selectIndices(int, int...) needs the first index plus a varargs tail.
+        int first = indices.get(0);
+        int[] rest = new int[indices.size() - 1];
+        for (int i = 1; i < indices.size(); i++) rest[i - 1] = indices.get(i);
+        selModel.selectIndices(first, rest);
     }
 
     private void restoreLastTab(ConfigManager.AppSettings settings) {
@@ -203,7 +236,10 @@ public class StocksMonitorController implements Initializable {
     private void initYahoooTableView() {
         yahooTableFavoriteQuotes.getSelectionModel().setSelectionMode(SelectionMode.MULTIPLE);
         yahooTableFavoriteQuotes.getSelectionModel().getSelectedItems().addListener((ListChangeListener<QuoteItem>) change -> {
-            List<QuoteItem> selectedQuotes = (List<QuoteItem>)change.getList();
+            List<QuoteItem> selectedQuotes = (List<QuoteItem>) change.getList();
+            if (!restoringSettings.get()) {
+                persistSettingAsync(ConfigManager.KEY_SELECTED_SYMBOLS, symbolsOf(selectedQuotes));
+            }
             handleSelectedQuotes(selectedQuotes);
         });
 
@@ -380,6 +416,14 @@ public class StocksMonitorController implements Initializable {
             showTabMessage(tabChart, "Select a ticker to see the chart");
             return;
         }
+        // Snapshot long names from the QuoteItems so the renderer can label legend rows.
+        final Map<String, String> longNames = new LinkedHashMap<>();
+        for (QuoteItem q : selected) {
+            if (q == null || q.getSymbol() == null) continue;
+            String ln = q.getLongname();
+            if (ln == null || ln.isEmpty()) ln = q.getShortname();
+            longNames.put(q.getSymbol(), ln == null ? "" : ln);
+        }
         final LocalDate from = yahooStartDatePicker.getValue();
         final LocalDate to = yahooEndDatePicker.getValue();
         if (from == null || to == null || from.isAfter(to)) {
@@ -412,7 +456,7 @@ public class StocksMonitorController implements Initializable {
             FxConverter converter = buildConverter(currencies, from, to);
             Platform.runLater(() -> {
                 if (requestId != chartRequestId.get()) return;
-                renderChart(bySymbol, divsBySymbol, converter);
+                renderChart(bySymbol, divsBySymbol, converter, longNames);
             });
             LogUtils.debugDuration(log, start, "loading yahoo chart");
         });
@@ -420,7 +464,8 @@ public class StocksMonitorController implements Initializable {
 
     private void renderChart(Map<String, List<HistoricalBar>> bySymbol,
                              Map<String, List<Dividend>> divsBySymbol,
-                             FxConverter conv) {
+                             FxConverter conv,
+                             Map<String, String> longNames) {
         NumberAxis xAxis = new NumberAxis();
         xAxis.setLabel("Date");
         xAxis.setForceZeroInRange(false);
@@ -449,20 +494,30 @@ public class StocksMonitorController implements Initializable {
         chart.setTitle("Close price");
         // Symbols must be created so each data point has a Node to attach a tooltip to.
         chart.setCreateSymbols(true);
-        chart.setLegendVisible(bySymbol.size() > 1);
+        // We render our own colour-matched legend below the chart, so suppress the built-in.
+        chart.setLegendVisible(false);
         chart.setAnimated(false);
 
         // Per-symbol map of converted close prices, used to position dividend points on the price line.
         Map<String, NavigableMap<LocalDate, Double>> closesBySymbol = new HashMap<>();
         Map<String, NavigableMap<LocalDate, Double>> nativeClosesBySymbol = new HashMap<>();
+        Map<String, String> colorBySymbol = new LinkedHashMap<>();
 
+        int colorIdx = 0;
         for (Map.Entry<String, List<HistoricalBar>> entry : bySymbol.entrySet()) {
+            String ticker = entry.getKey();
+            String color = chartColor(colorIdx++);
+            colorBySymbol.put(ticker, color);
+
             XYChart.Series<Number, Number> series = new XYChart.Series<>();
-            // In Native mode with mixed currencies, append the per-series currency to the legend.
-            String seriesName = entry.getKey();
+            // Use the symbol as the series name (so tooltip header reads cleanly).
+            // In Native mode with mixed currencies, append the per-series currency.
+            String seriesName = ticker;
+            String longName = longNames == null ? null : longNames.get(ticker);
+            if (longName != null && !longName.isEmpty()) seriesName = ticker + " — " + longName;
             if (conv == null && nativeCcys.size() > 1 && !entry.getValue().isEmpty()) {
                 String c = entry.getValue().get(0).currency();
-                if (c != null && !c.isEmpty()) seriesName = entry.getKey() + " (" + c + ")";
+                if (c != null && !c.isEmpty()) seriesName = seriesName + " (" + c + ")";
             }
             series.setName(seriesName);
             NavigableMap<LocalDate, Double> closes = new TreeMap<>();
@@ -474,18 +529,21 @@ public class StocksMonitorController implements Initializable {
                 closes.put(bar.date(), y);
                 nativeCloses.put(bar.date(), bar.close());
             }
-            closesBySymbol.put(entry.getKey(), closes);
-            nativeClosesBySymbol.put(entry.getKey(), nativeCloses);
+            closesBySymbol.put(ticker, closes);
+            nativeClosesBySymbol.put(ticker, nativeCloses);
             if (series.getData().isEmpty()) continue;
             chart.getData().add(series);
-            // Style the price line light-blue (overrides JavaFX default series colour).
+            // Style the price line in this ticker's palette colour.
+            String lineStyle = "-fx-stroke: " + color + "; -fx-stroke-width: 1.5px;";
+            String dotDefault = "-fx-background-color: " + color + "; -fx-background-radius: 2px; -fx-padding: 2px;";
+            String dotHover = "-fx-background-color: " + color + "; -fx-background-radius: 5px; -fx-padding: 5px;";
             Node priceLineNode = series.getNode();
-            if (priceLineNode != null) priceLineNode.setStyle(PRICE_LINE_STYLE);
+            if (priceLineNode != null) priceLineNode.setStyle(lineStyle);
             // Symbol Nodes are created when the series is added; attach tooltips after.
-            attachPointTooltips(series, conv == null ? null : conv.target());
+            attachPointTooltips(series, conv == null ? null : conv.target(), dotDefault, dotHover);
         }
 
-        // Overlay dividend points per ticker: red dots positioned on the price line at each div date.
+        // Overlay dividend points per ticker: green dots positioned on the price line at each div date.
         for (Map.Entry<String, List<Dividend>> entry : divsBySymbol.entrySet()) {
             String ticker = entry.getKey();
             List<Dividend> dividends = entry.getValue();
@@ -526,10 +584,10 @@ public class StocksMonitorController implements Initializable {
 
             if (divSeries.getData().isEmpty()) continue;
             chart.getData().add(divSeries);
-            // Hide the connecting line — we want dots only, not a red zigzag.
+            // Hide the connecting line — we want dots only, not a green zigzag.
             Node lineNode = divSeries.getNode();
             if (lineNode != null) lineNode.setStyle("-fx-stroke: transparent;");
-            // Style each data point as a red marker and attach a hover tooltip.
+            // Style each data point as a green marker and attach a hover tooltip.
             attachDividendTooltips(divSeries, tipData);
         }
 
@@ -537,7 +595,25 @@ public class StocksMonitorController implements Initializable {
             showTabMessage(tabChart, "No history found for the selected range");
             return;
         }
-        tabChart.setContent(new StackPane(chart));
+
+        // Custom legend below the chart: per-ticker swatch + "SYM | Long Name".
+        FlowPane legend = new FlowPane(16, 6);
+        legend.setPadding(new Insets(8, 12, 8, 12));
+        for (Map.Entry<String, String> e : colorBySymbol.entrySet()) {
+            String ticker = e.getKey();
+            String color = e.getValue();
+            String longName = longNames == null ? null : longNames.get(ticker);
+            String labelText = (longName == null || longName.isEmpty()) ? ticker : ticker + " | " + longName;
+            Rectangle swatch = new Rectangle(14, 4, Color.web(color));
+            Label label = new Label(labelText);
+            HBox row = new HBox(6, swatch, label);
+            row.setAlignment(Pos.CENTER_LEFT);
+            legend.getChildren().add(row);
+        }
+
+        VBox container = new VBox(chart, legend);
+        VBox.setVgrow(chart, Priority.ALWAYS);
+        tabChart.setContent(container);
     }
 
     private record DividendPoint(String symbol, LocalDate date, double displayAmount,
@@ -576,7 +652,8 @@ public class StocksMonitorController implements Initializable {
         }
     }
 
-    private static void attachPointTooltips(XYChart.Series<Number, Number> series, String currencySuffix) {
+    private static void attachPointTooltips(XYChart.Series<Number, Number> series, String currencySuffix,
+                                            String dotDefault, String dotHover) {
         final String header = series.getName();
         final String suffix = (currencySuffix == null || currencySuffix.isEmpty()) ? "" : " " + currencySuffix;
         for (XYChart.Data<Number, Number> data : series.getData()) {
@@ -594,9 +671,9 @@ public class StocksMonitorController implements Initializable {
             tip.setHideDelay(Duration.millis(200));
             Tooltip.install(node, tip);
             node.setCursor(Cursor.HAND);
-            node.setStyle(PRICE_DOT_DEFAULT);
-            node.setOnMouseEntered(_ -> node.setStyle(PRICE_DOT_HOVER));
-            node.setOnMouseExited(_ -> node.setStyle(PRICE_DOT_DEFAULT));
+            node.setStyle(dotDefault);
+            node.setOnMouseEntered(_ -> node.setStyle(dotHover));
+            node.setOnMouseExited(_ -> node.setStyle(dotDefault));
         }
     }
 

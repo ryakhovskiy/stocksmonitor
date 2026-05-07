@@ -37,6 +37,7 @@ public class ConfigManager {
     public static final String KEY_END_DATE = "endDate";
     public static final String KEY_SLIDER_VALUE = "sliderValue";
     public static final String KEY_LAST_TAB = "lastTab";
+    public static final String KEY_SELECTED_SYMBOLS = "selectedSymbols";
 
     private static final ConfigManager instance = new ConfigManager();
 
@@ -56,7 +57,8 @@ public class ConfigManager {
                               LocalDate startDate,
                               LocalDate endDate,
                               int sliderValue,
-                              String lastTab) {}
+                              String lastTab,
+                              List<String> selectedSymbols) {}
 
     private ConfigManager() {
         try {
@@ -124,13 +126,25 @@ public class ConfigManager {
     public AppSettings readSettings() {
         synchronized (settingsLock) {
             JSONObject obj = readSettingsObject();
+            JSONArray symArr = obj.optJSONArray(KEY_SELECTED_SYMBOLS);
+            List<String> selectedSymbols;
+            if (symArr == null) {
+                selectedSymbols = List.of();
+            } else {
+                selectedSymbols = new ArrayList<>(symArr.length());
+                for (int i = 0; i < symArr.length(); i++) {
+                    String s = symArr.optString(i, "");
+                    if (!s.isEmpty()) selectedSymbols.add(s);
+                }
+            }
             return new AppSettings(
                     obj.optString(KEY_LAST_SEARCH_TERM, ""),
                     obj.optString(KEY_CURRENCY, ""),
                     parseDate(obj.optString(KEY_START_DATE, "")),
                     parseDate(obj.optString(KEY_END_DATE, "")),
                     obj.optInt(KEY_SLIDER_VALUE, -1),
-                    obj.optString(KEY_LAST_TAB, "")
+                    obj.optString(KEY_LAST_TAB, ""),
+                    selectedSymbols
             );
         }
     }
