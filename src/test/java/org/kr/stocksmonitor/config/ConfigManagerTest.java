@@ -1,7 +1,7 @@
 package org.kr.stocksmonitor.config;
 
 import org.junit.jupiter.api.Test;
-import org.kr.stocksmonitor.yahoo.QuoteItem;
+import org.kr.stocksmonitor.model.Instrument;
 
 import java.util.List;
 
@@ -11,25 +11,22 @@ class ConfigManagerTest {
 
     @Test
     void testFavoriteQuotes() {
-
-        //symbol_ACN = {"symbol":"ACN","longname":"Accenture plc","typeDisp":"Aktie","exchDisp":"NYSE","index":"quotes","exchange":"NYQ","isYahooFinance":true,"shortname":"Accenture plc","quoteType":"EQUITY"}
-
         final ConfigManager configManager = ConfigManager.getInstance();
-        final List<QuoteItem> quotes = List.of(
-                new QuoteItem("ex.1", "test short", "ETF", "X1", "ind", "disp", "long", "exch", false),
-                new QuoteItem("ex2", "test short2", "ETF", "X2", "ind", "disp", "long", "exch", false),
-                new QuoteItem("ex3", "test short3", "ETF", "X3", "ind", "disp", "long", "exch", false),
-                new QuoteItem("ex4", "test short4", "ETF", "X4", "ind", "disp", "long", "exch", false)
+        final List<Instrument> quotes = List.of(
+                new Instrument("test", "ex.1", "test short", "ETF", "X1", "ind", "disp", "long", "exch", false),
+                new Instrument("test", "ex2", "test short2", "ETF", "X2", "ind", "disp", "long", "exch", false),
+                new Instrument("test", "ex3", "test short3", "ETF", "X3", "ind", "disp", "long", "exch", false),
+                new Instrument("test", "ex4", "test short4", "ETF", "X4", "ind", "disp", "long", "exch", false)
         );
 
         configManager.saveFavoriteQuotes(quotes);
-        List<QuoteItem> configQuotes = configManager.readFavoriteQuotes();
+        List<Instrument> configQuotes = configManager.readFavoriteQuotes();
         assertFalse(configQuotes.isEmpty());
         assertTrue(quotes.containsAll(configQuotes));
 
         configManager.deleteFavoriteQuotes(quotes);
         configQuotes = configManager.readFavoriteQuotes();
-        for (QuoteItem q : quotes)
+        for (Instrument q : quotes)
             assertFalse(configQuotes.contains(q));
     }
 }

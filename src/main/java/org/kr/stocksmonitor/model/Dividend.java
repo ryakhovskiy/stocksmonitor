@@ -1,4 +1,4 @@
-package org.kr.stocksmonitor.yahoo;
+package org.kr.stocksmonitor.model;
 
 import java.time.LocalDate;
 

@@ -7,6 +7,7 @@ import javafx.scene.Scene;
 import javafx.stage.Stage;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.kr.stocksmonitor.api.ProviderRegistry;
 
 import java.io.IOException;
 
@@ -28,6 +29,9 @@ public class StocksMonitor extends Application {
 
         controller = fxmlLoader.getController();
         controller.injectHostServices(getHostServices());
+        // Strategy + ServiceLoader: discover providers + pick a default FX provider, then inject.
+        ProviderRegistry registry = ProviderRegistry.getInstance();
+        controller.setProviders(registry, registry.getDefaultFx().orElse(null));
     }
 
     @Override

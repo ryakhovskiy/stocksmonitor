@@ -36,14 +36,17 @@ import java.net.*;
 import javafx.util.StringConverter;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.kr.stocksmonitor.api.DataAccessException;
+import org.kr.stocksmonitor.api.FxRateProvider;
+import org.kr.stocksmonitor.api.MarketDataProvider;
+import org.kr.stocksmonitor.api.ProviderRegistry;
 import org.kr.stocksmonitor.config.ConfigManager;
+import org.kr.stocksmonitor.model.Dividend;
+import org.kr.stocksmonitor.model.HistoricalBar;
+import org.kr.stocksmonitor.model.Instrument;
+import org.kr.stocksmonitor.model.NewsItem;
+import org.kr.stocksmonitor.model.QuoteSnapshot;
 import org.kr.stocksmonitor.utils.LogUtils;
-import org.kr.stocksmonitor.yahoo.Dividend;
-import org.kr.stocksmonitor.yahoo.HistoricalBar;
-import org.kr.stocksmonitor.yahoo.NewsItem;
-import org.kr.stocksmonitor.yahoo.QuoteItem;
-import org.kr.stocksmonitor.yahoo.QuoteSnapshot;
-import org.kr.stocksmonitor.yahoo.YahooAPI;
 
 import java.io.IOException;
 import java.time.Instant;
@@ -109,12 +112,47 @@ public class StocksMonitorController implements Initializable {
     public DatePicker yahooEndDatePicker;
     public Slider yahooDateRangeSlider;
     public Label yahooDateRangeLabel;
-    public TableView<QuoteItem> yahooTableFavoriteQuotes;
+    public TableView<Instrument> yahooTableFavoriteQuotes;
 
     protected HostServices hostServices;
 
+    /** Strategy seam — set by {@link StocksMonitor#start} after FXML load. Lazily falls back to {@link ProviderRegistry#getInstance()} for tests. */
+    protected ProviderRegistry providerRegistry;
+    /** Single global FX provider. Lazily resolved via the registry's first FX-capable provider. */
+    protected FxRateProvider fxProvider;
+
     protected void injectHostServices(HostServices hostServices) {
         this.hostServices = hostServices;
+    }
+
+    /** DI hook called from {@link StocksMonitor#start}. Optional — if not called, the registry singleton is used. */
+    protected void setProviders(ProviderRegistry registry, FxRateProvider fxProvider) {
+        this.providerRegistry = registry;
+        this.fxProvider = fxProvider;
+    }
+
+    private ProviderRegistry registry() {
+        ProviderRegistry r = providerRegistry;
+        if (r == null) { r = ProviderRegistry.getInstance(); providerRegistry = r; }
+        return r;
+    }
+
+    private FxRateProvider fx() {
+        FxRateProvider f = fxProvider;
+        if (f == null) {
+            f = registry().getDefaultFx().orElse(null);
+            fxProvider = f;
+        }
+        return f;
+    }
+
+    /** Route a per-instrument data call to the provider that owns the instrument. */
+    private MarketDataProvider providerFor(Instrument instrument) {
+        return registry().get(instrument == null ? null : instrument.getProviderId());
+    }
+
+    private MarketDataProvider providerFor(String providerId) {
+        return registry().get(providerId);
     }
 
     @Override
@@ -143,16 +181,24 @@ public class StocksMonitorController implements Initializable {
         if (settings == null) return;
         List<String> wanted = settings.selectedSymbols();
         if (wanted == null || wanted.isEmpty()) return;
-        ObservableList<QuoteItem> items = yahooTableFavoriteQuotes.getItems();
-        Set<String> wantedSet = new HashSet<>(wanted);
+        // Persisted as "providerId:symbol" — accept legacy bare-symbol entries by defaulting to "yahoo".
+        Set<String> wantedKeys = new HashSet<>();
+        for (String w : wanted) {
+            if (w == null || w.isEmpty()) continue;
+            int colon = w.indexOf(':');
+            if (colon < 0) wantedKeys.add(Instrument.LEGACY_DEFAULT_PROVIDER_ID + ":" + w);
+            else wantedKeys.add(w);
+        }
+        ObservableList<Instrument> items = yahooTableFavoriteQuotes.getItems();
         List<Integer> indices = new ArrayList<>();
         for (int i = 0; i < items.size(); i++) {
-            QuoteItem q = items.get(i);
-            if (q != null && q.getSymbol() != null && wantedSet.contains(q.getSymbol())) indices.add(i);
+            Instrument q = items.get(i);
+            if (q == null || q.getSymbol() == null) continue;
+            String key = q.getProviderId() + ":" + q.getSymbol();
+            if (wantedKeys.contains(key)) indices.add(i);
         }
         if (indices.isEmpty()) return;
         var selModel = yahooTableFavoriteQuotes.getSelectionModel();
-        // selectIndices(int, int...) needs the first index plus a varargs tail.
         int first = indices.get(0);
         int[] rest = new int[indices.size() - 1];
         for (int i = 1; i < indices.size(); i++) rest[i - 1] = indices.get(i);
@@ -176,9 +222,9 @@ public class StocksMonitorController implements Initializable {
 
     /** User-initiated refresh: invalidate cached data for selected symbols, then reload the visible tab. */
     private void forceRefreshActiveTab() {
-        List<QuoteItem> selected = yahooTableFavoriteQuotes.getSelectionModel().getSelectedItems();
-        for (QuoteItem q : selected) {
-            if (q != null && q.getSymbol() != null) YahooAPI.getInstance().invalidate(q.getSymbol());
+        List<Instrument> selected = yahooTableFavoriteQuotes.getSelectionModel().getSelectedItems();
+        for (Instrument q : selected) {
+            if (q != null && q.getSymbol() != null) providerFor(q).invalidate(q.getSymbol());
         }
         handleSelectedQuotes(selected);
     }
@@ -235,10 +281,10 @@ public class StocksMonitorController implements Initializable {
 
     private void initYahoooTableView() {
         yahooTableFavoriteQuotes.getSelectionModel().setSelectionMode(SelectionMode.MULTIPLE);
-        yahooTableFavoriteQuotes.getSelectionModel().getSelectedItems().addListener((ListChangeListener<QuoteItem>) change -> {
-            List<QuoteItem> selectedQuotes = (List<QuoteItem>) change.getList();
+        yahooTableFavoriteQuotes.getSelectionModel().getSelectedItems().addListener((ListChangeListener<Instrument>) change -> {
+            List<Instrument> selectedQuotes = (List<Instrument>) change.getList();
             if (!restoringSettings.get()) {
-                persistSettingAsync(ConfigManager.KEY_SELECTED_SYMBOLS, symbolsOf(selectedQuotes));
+                persistSettingAsync(ConfigManager.KEY_SELECTED_SYMBOLS, selectionKeysOf(selectedQuotes));
             }
             handleSelectedQuotes(selectedQuotes);
         });
@@ -256,7 +302,7 @@ public class StocksMonitorController implements Initializable {
 
         loadFavoriteQuotes();
         // Persist favorites on every add/remove — don't wait for shutdown.
-        yahooTableFavoriteQuotes.getItems().addListener((ListChangeListener<QuoteItem>) c -> {
+        yahooTableFavoriteQuotes.getItems().addListener((ListChangeListener<Instrument>) c -> {
             if (restoringSettings.get()) return;
             persistFavoritesAsync();
         });
@@ -276,49 +322,49 @@ public class StocksMonitorController implements Initializable {
 
     private void persistFavoritesAsync() {
         // Snapshot the items on the FX thread; write off-thread.
-        List<QuoteItem> snapshot = new ArrayList<>(yahooTableFavoriteQuotes.getItems());
+        List<Instrument> snapshot = new ArrayList<>(yahooTableFavoriteQuotes.getItems());
         executorService.submit(() -> ConfigManager.getInstance().saveFavoriteQuotes(snapshot));
     }
 
     private void removeSelectedFavorites() {
         // Copy first — getSelectedItems is observable and removeAll mutates it as we go.
-        List<QuoteItem> toRemove = new ArrayList<>(yahooTableFavoriteQuotes.getSelectionModel().getSelectedItems());
+        List<Instrument> toRemove = new ArrayList<>(yahooTableFavoriteQuotes.getSelectionModel().getSelectedItems());
         if (toRemove.isEmpty()) return;
         yahooTableFavoriteQuotes.getItems().removeAll(toRemove);
     }
 
     private void setYahooTableFavoriteQuotesColumns() {
-        TableColumn<QuoteItem, String> typeDispColumn = new TableColumn<>("Type");
+        TableColumn<Instrument, String> typeDispColumn = new TableColumn<>("Type");
         typeDispColumn.setCellValueFactory(data -> Bindings.createStringBinding(() ->
                 data.getValue().getTypeDisp()));
         typeDispColumn.setPrefWidth(60);
 
-        TableColumn<QuoteItem, String> symbolColumn = new TableColumn<>("Symbol");
+        TableColumn<Instrument, String> symbolColumn = new TableColumn<>("Symbol");
         symbolColumn.setCellValueFactory(data -> Bindings.createStringBinding(() ->
                 data.getValue().getSymbol()));
         symbolColumn.setPrefWidth(60);
 
-        TableColumn<QuoteItem, String> shortnameColumn = new TableColumn<>("Short Name");
+        TableColumn<Instrument, String> shortnameColumn = new TableColumn<>("Short Name");
         shortnameColumn.setCellValueFactory(data -> Bindings.createStringBinding(() ->
                 data.getValue().getShortname()));
         shortnameColumn.setPrefWidth(220);
 
-        TableColumn<QuoteItem, String> longnameColumn = new TableColumn<>("Long Name");
+        TableColumn<Instrument, String> longnameColumn = new TableColumn<>("Long Name");
         longnameColumn.setCellValueFactory(data -> Bindings.createStringBinding(() ->
                 data.getValue().getLongname()));
         longnameColumn.setPrefWidth(300);
 
-        TableColumn<QuoteItem, String> assetClassColumn = new TableColumn<>("Asset Class");
+        TableColumn<Instrument, String> assetClassColumn = new TableColumn<>("Asset Class");
         assetClassColumn.setCellValueFactory(data -> Bindings.createStringBinding(() ->
                 data.getValue().getQuoteType()));
         assetClassColumn.setPrefWidth(90);
 
-        TableColumn<QuoteItem, String> exchangeColumn = new TableColumn<>("Exch");
+        TableColumn<Instrument, String> exchangeColumn = new TableColumn<>("Exch");
         exchangeColumn.setCellValueFactory(data -> Bindings.createStringBinding(() ->
                 data.getValue().getExchange()));
         exchangeColumn.setPrefWidth(60);
 
-        TableColumn<QuoteItem, String> exchDispColumn = new TableColumn<>("Exchange");
+        TableColumn<Instrument, String> exchDispColumn = new TableColumn<>("Exchange");
         exchDispColumn.setCellValueFactory(data -> Bindings.createStringBinding(() ->
                 data.getValue().getExchDisp()));
         exchDispColumn.setPrefWidth(90);
@@ -328,7 +374,7 @@ public class StocksMonitorController implements Initializable {
                 assetClassColumn, exchangeColumn, exchDispColumn);
     }
 
-    private void handleSelectedQuotes(List<QuoteItem> selectedQuotes) {
+    private void handleSelectedQuotes(List<Instrument> selectedQuotes) {
         log.debug(selectedQuotes);
         Tab active = tabPaneData.getSelectionModel().getSelectedItem();
         if (active == tabNews) loadNewsForSelection(selectedQuotes);
@@ -369,7 +415,7 @@ public class StocksMonitorController implements Initializable {
         ScheduledFuture<?> future = debounceExecutor.schedule(
                 () -> Platform.runLater(() -> {
                     Tab active = tabPaneData.getSelectionModel().getSelectedItem();
-                    List<QuoteItem> selected = yahooTableFavoriteQuotes.getSelectionModel().getSelectedItems();
+                    List<Instrument> selected = yahooTableFavoriteQuotes.getSelectionModel().getSelectedItems();
                     if (active == tabHistory) loadHistoryForSelection(selected);
                     else if (active == tabChart) loadChartForSelection(selected);
                     else if (active == tabDividend) loadDividendForSelection(selected);
@@ -378,9 +424,9 @@ public class StocksMonitorController implements Initializable {
         pendingDateReload.set(future);
     }
 
-    private void loadDataForSelection(List<QuoteItem> selected) {
-        final List<String> symbols = symbolsOf(selected);
-        if (symbols.isEmpty()) {
+    private void loadDataForSelection(List<Instrument> selected) {
+        final List<Instrument> instruments = uniqueBySymbol(selected);
+        if (instruments.isEmpty()) {
             showTabMessage(tabData, "Select a ticker to see today's data");
             return;
         }
@@ -388,13 +434,14 @@ public class StocksMonitorController implements Initializable {
         final long requestId = dataRequestId.incrementAndGet();
         executorService.submit(() -> {
             Instant start = Instant.now();
-            List<QuoteSnapshot> snapshots = new ArrayList<>(symbols.size());
-            for (String symbol : symbols) {
+            List<QuoteSnapshot> snapshots = new ArrayList<>(instruments.size());
+            for (Instrument inst : instruments) {
+                if (!providerFor(inst).capabilities().contains(org.kr.stocksmonitor.api.Capability.SNAPSHOT)) continue;
                 try {
-                    QuoteSnapshot snap = YahooAPI.getInstance().getSnapshot(symbol);
+                    QuoteSnapshot snap = providerFor(inst).getSnapshot(inst.getSymbol());
                     if (snap != null) snapshots.add(snap);
-                } catch (IOException e) {
-                    log.error("Error fetching snapshot for {}", symbol, e);
+                } catch (DataAccessException e) {
+                    log.error("Error fetching snapshot for {}/{}", inst.getProviderId(), inst.getSymbol(), e);
                 }
             }
             // Snapshot is "now" data; pull a small recent FX window so floorEntry can resolve weekend dates.
@@ -410,16 +457,15 @@ public class StocksMonitorController implements Initializable {
         });
     }
 
-    private void loadChartForSelection(List<QuoteItem> selected) {
-        final List<String> symbols = symbolsOf(selected);
-        if (symbols.isEmpty()) {
+    private void loadChartForSelection(List<Instrument> selected) {
+        final List<Instrument> instruments = uniqueBySymbol(selected);
+        if (instruments.isEmpty()) {
             showTabMessage(tabChart, "Select a ticker to see the chart");
             return;
         }
-        // Snapshot long names from the QuoteItems so the renderer can label legend rows.
+        // Snapshot long names from the Instruments so the renderer can label legend rows.
         final Map<String, String> longNames = new LinkedHashMap<>();
-        for (QuoteItem q : selected) {
-            if (q == null || q.getSymbol() == null) continue;
+        for (Instrument q : instruments) {
             String ln = q.getLongname();
             if (ln == null || ln.isEmpty()) ln = q.getShortname();
             longNames.put(q.getSymbol(), ln == null ? "" : ln);
@@ -436,16 +482,24 @@ public class StocksMonitorController implements Initializable {
             Instant start = Instant.now();
             LinkedHashMap<String, List<HistoricalBar>> bySymbol = new LinkedHashMap<>();
             LinkedHashMap<String, List<Dividend>> divsBySymbol = new LinkedHashMap<>();
-            for (String symbol : symbols) {
-                try {
-                    bySymbol.put(symbol, YahooAPI.getInstance().getHistory(symbol, from, to));
-                } catch (IOException e) {
-                    log.error("Error fetching history for {} {}..{}", symbol, from, to, e);
+            for (Instrument inst : instruments) {
+                MarketDataProvider p = providerFor(inst);
+                String symbol = inst.getSymbol();
+                if (p.capabilities().contains(org.kr.stocksmonitor.api.Capability.HISTORY)) {
+                    try {
+                        bySymbol.put(symbol, p.getHistory(symbol, from, to));
+                    } catch (DataAccessException e) {
+                        log.error("Error fetching history for {}/{} {}..{}", inst.getProviderId(), symbol, from, to, e);
+                    }
                 }
-                try {
-                    divsBySymbol.put(symbol, YahooAPI.getInstance().getDividends(symbol, from, to));
-                } catch (IOException e) {
-                    log.error("Error fetching dividends for {} {}..{}", symbol, from, to, e);
+                if (p.capabilities().contains(org.kr.stocksmonitor.api.Capability.DIVIDENDS)) {
+                    try {
+                        divsBySymbol.put(symbol, p.getDividends(symbol, from, to));
+                    } catch (DataAccessException e) {
+                        log.error("Error fetching dividends for {}/{} {}..{}", inst.getProviderId(), symbol, from, to, e);
+                        divsBySymbol.put(symbol, List.of());
+                    }
+                } else {
                     divsBySymbol.put(symbol, List.of());
                 }
             }
@@ -677,9 +731,9 @@ public class StocksMonitorController implements Initializable {
         }
     }
 
-    private void loadHistoryForSelection(List<QuoteItem> selected) {
-        final List<String> symbols = symbolsOf(selected);
-        if (symbols.isEmpty()) {
+    private void loadHistoryForSelection(List<Instrument> selected) {
+        final List<Instrument> instruments = uniqueBySymbol(selected);
+        if (instruments.isEmpty()) {
             showTabMessage(tabHistory, "Select a ticker to see history");
             return;
         }
@@ -694,11 +748,13 @@ public class StocksMonitorController implements Initializable {
         executorService.submit(() -> {
             Instant start = Instant.now();
             List<HistoricalBar> bars = new ArrayList<>();
-            for (String symbol : symbols) {
+            for (Instrument inst : instruments) {
+                MarketDataProvider p = providerFor(inst);
+                if (!p.capabilities().contains(org.kr.stocksmonitor.api.Capability.HISTORY)) continue;
                 try {
-                    bars.addAll(YahooAPI.getInstance().getHistory(symbol, from, to));
-                } catch (IOException e) {
-                    log.error("Error fetching history for {} {}..{}", symbol, from, to, e);
+                    bars.addAll(p.getHistory(inst.getSymbol(), from, to));
+                } catch (DataAccessException e) {
+                    log.error("Error fetching history for {}/{} {}..{}", inst.getProviderId(), inst.getSymbol(), from, to, e);
                 }
             }
             bars.sort(Comparator.comparing(HistoricalBar::date).reversed()
@@ -713,9 +769,9 @@ public class StocksMonitorController implements Initializable {
         });
     }
 
-    private void loadDividendForSelection(List<QuoteItem> selected) {
-        final List<String> symbols = symbolsOf(selected);
-        if (symbols.isEmpty()) {
+    private void loadDividendForSelection(List<Instrument> selected) {
+        final List<Instrument> instruments = uniqueBySymbol(selected);
+        if (instruments.isEmpty()) {
             showTabMessage(tabDividend, "Select a ticker to see dividends");
             return;
         }
@@ -729,26 +785,31 @@ public class StocksMonitorController implements Initializable {
         final long requestId = dividendRequestId.incrementAndGet();
         executorService.submit(() -> {
             Instant start = Instant.now();
-            // Fetch dividends and history per symbol in parallel — they're independent network calls,
+            // Fetch dividends and history per instrument in parallel — they're independent network calls,
             // and the dividend tab needs both (yield = amount / close * 100, FX-invariant).
-            List<CompletableFuture<SymbolDividendData>> futures = new ArrayList<>(symbols.size());
-            for (String symbol : symbols) {
+            List<CompletableFuture<SymbolDividendData>> futures = new ArrayList<>(instruments.size());
+            for (Instrument inst : instruments) {
+                final MarketDataProvider p = providerFor(inst);
+                final String symbol = inst.getSymbol();
+                final String pid = inst.getProviderId();
                 CompletableFuture<List<Dividend>> divFut = CompletableFuture.supplyAsync(() -> {
+                    if (!p.capabilities().contains(org.kr.stocksmonitor.api.Capability.DIVIDENDS)) return List.<Dividend>of();
                     try {
-                        return YahooAPI.getInstance().getDividends(symbol, from, to);
-                    } catch (IOException e) {
-                        log.error("Error fetching dividends for {} {}..{}", symbol, from, to, e);
-                        return List.of();
+                        return p.getDividends(symbol, from, to);
+                    } catch (DataAccessException e) {
+                        log.error("Error fetching dividends for {}/{} {}..{}", pid, symbol, from, to, e);
+                        return List.<Dividend>of();
                     }
                 }, executorService);
                 CompletableFuture<NavigableMap<LocalDate, Double>> histFut = CompletableFuture.supplyAsync(() -> {
                     NavigableMap<LocalDate, Double> closes = new TreeMap<>();
+                    if (!p.capabilities().contains(org.kr.stocksmonitor.api.Capability.HISTORY)) return closes;
                     try {
-                        for (HistoricalBar bar : YahooAPI.getInstance().getHistory(symbol, from, to)) {
+                        for (HistoricalBar bar : p.getHistory(symbol, from, to)) {
                             if (!Double.isNaN(bar.close())) closes.put(bar.date(), bar.close());
                         }
-                    } catch (IOException e) {
-                        log.error("Error fetching history for yield calc {} {}..{}", symbol, from, to, e);
+                    } catch (DataAccessException e) {
+                        log.error("Error fetching history for yield calc {}/{} {}..{}", pid, symbol, from, to, e);
                     }
                     return closes;
                 }, executorService);
@@ -837,11 +898,37 @@ public class StocksMonitorController implements Initializable {
         return div.amount() / price * 100.0;
     }
 
-    private static List<String> symbolsOf(List<QuoteItem> selected) {
+    private static List<String> symbolsOf(List<Instrument> selected) {
         if (selected == null || selected.isEmpty()) return List.of();
         return selected.stream()
-                .map(QuoteItem::getSymbol)
+                .map(Instrument::getSymbol)
                 .filter(s -> s != null && !s.isEmpty())
+                .distinct()
+                .toList();
+    }
+
+    /**
+     * Snapshot the selection (it's an observable list) and dedup by {@code (providerId, symbol)} so the
+     * loaders never issue duplicate requests for the same instrument when the same row is shown twice.
+     */
+    private static List<Instrument> uniqueBySymbol(List<Instrument> selected) {
+        if (selected == null || selected.isEmpty()) return List.of();
+        Set<String> seen = new HashSet<>();
+        List<Instrument> out = new ArrayList<>(selected.size());
+        for (Instrument i : selected) {
+            if (i == null || i.getSymbol() == null || i.getSymbol().isEmpty()) continue;
+            String key = i.getProviderId() + "|" + i.getSymbol();
+            if (seen.add(key)) out.add(i);
+        }
+        return out;
+    }
+
+    /** Encode a selected instrument as {@code "providerId:symbol"} for persisted settings. */
+    private static List<String> selectionKeysOf(List<Instrument> selected) {
+        if (selected == null || selected.isEmpty()) return List.of();
+        return selected.stream()
+                .filter(i -> i != null && i.getSymbol() != null && !i.getSymbol().isEmpty())
+                .map(i -> i.getProviderId() + ":" + i.getSymbol())
                 .distinct()
                 .toList();
     }
@@ -940,11 +1027,16 @@ public class StocksMonitorController implements Initializable {
         if (targetCurrency == TargetCurrency.Native) return null;
         final String target = targetCurrency.name();
         Map<String, java.util.NavigableMap<LocalDate, Double>> rates = new HashMap<>();
+        FxRateProvider fxp = fx();
+        if (fxp == null) {
+            log.warn("No FX rate provider available; conversion to {} disabled", target);
+            return new FxConverter(target, rates);
+        }
         for (String c : nativeCurrencies) {
             if (c == null || c.isEmpty() || c.equalsIgnoreCase(target)) continue;
             try {
-                rates.put(c, YahooAPI.getInstance().getFxRates(c, target, from, to));
-            } catch (IOException e) {
+                rates.put(c, fxp.getFxRates(c, target, from, to));
+            } catch (DataAccessException e) {
                 log.error("Error loading FX {}->{}", c, target, e);
             }
         }
@@ -1039,10 +1131,10 @@ public class StocksMonitorController implements Initializable {
         return col;
     }
 
-    private void loadNewsForSelection(List<QuoteItem> selected) {
-        // Snapshot the symbols — selectedItems is observable and may mutate before the worker runs.
-        final List<String> symbols = symbolsOf(selected);
-        if (symbols.isEmpty()) {
+    private void loadNewsForSelection(List<Instrument> selected) {
+        // Snapshot the selection — selectedItems is observable and may mutate before the worker runs.
+        final List<Instrument> instruments = uniqueBySymbol(selected);
+        if (instruments.isEmpty()) {
             showTabMessage(tabNews, "Select a ticker to see news");
             return;
         }
@@ -1052,14 +1144,16 @@ public class StocksMonitorController implements Initializable {
             Instant start = Instant.now();
             // LinkedHashMap dedups by uuid while preserving insertion order across symbols.
             Map<String, NewsItem> dedup = new LinkedHashMap<>();
-            for (String symbol : symbols) {
+            for (Instrument inst : instruments) {
+                MarketDataProvider p = providerFor(inst);
+                if (!p.capabilities().contains(org.kr.stocksmonitor.api.Capability.NEWS)) continue;
                 try {
-                    for (NewsItem item : YahooAPI.getInstance().getNews(symbol)) {
+                    for (NewsItem item : p.getNews(inst.getSymbol())) {
                         if (!item.uuid().isEmpty()) dedup.putIfAbsent(item.uuid(), item);
                         else dedup.putIfAbsent(item.link(), item);
                     }
-                } catch (IOException e) {
-                    log.error("Error fetching news for {}", symbol, e);
+                } catch (DataAccessException e) {
+                    log.error("Error fetching news for {}/{}", inst.getProviderId(), inst.getSymbol(), e);
                 }
             }
             List<NewsItem> news = new ArrayList<>(dedup.values());
@@ -1133,14 +1227,14 @@ public class StocksMonitorController implements Initializable {
 
     private void loadFavoriteQuotes() {
         log.debug("loading favorite quotes...");
-        List<QuoteItem> favQuotes = ConfigManager.getInstance().readFavoriteQuotes();
+        List<Instrument> favQuotes = ConfigManager.getInstance().readFavoriteQuotes();
         if (favQuotes.isEmpty()) return;
         log.debug("adding favorite quotes to the table: {}", favQuotes);
         yahooTableFavoriteQuotes.getItems().addAll(favQuotes);
     }
 
     private void initYahoooSymbolsCombobox(ConfigManager.AppSettings settings) {
-        ComboBoxListViewSkin<QuoteItem> skin = new ComboBoxListViewSkin<>(cbxYahooQuote);
+        ComboBoxListViewSkin<Instrument> skin = new ComboBoxListViewSkin<>(cbxYahooQuote);
         skin.getPopupContent().addEventFilter(KeyEvent.ANY, e -> {
             if (e.getCode() == KeyCode.UNDEFINED) {
                 log.debug("initYahoooTickersCombobox() {}", e);
@@ -1165,7 +1259,7 @@ public class StocksMonitorController implements Initializable {
             if (!cbxYahooQuote.isShowing()) return;
             final Object value = cbxYahooQuote.getSelectionModel().getSelectedItem();
             log.debug("selected: {}", value);
-            if (!(value instanceof QuoteItem selected))
+            if (!(value instanceof Instrument selected))
                 return;
             var items = yahooTableFavoriteQuotes.getItems();
             if (items.contains(selected)) return;
@@ -1182,28 +1276,38 @@ public class StocksMonitorController implements Initializable {
     private void reloadYahooTickerCombobox(String value) {
         if (value.isEmpty())
             return;
-        log.debug("reloading yahoo quotes data: {}", value);
+        log.debug("reloading quotes data: {}", value);
         ScheduledFuture<?> prev = pendingSearch.getAndSet(null);
         if (prev != null) prev.cancel(false);
         ScheduledFuture<?> future = debounceExecutor.schedule(() -> {
             Instant start = Instant.now();
             try {
-                List<QuoteItem> quotes = YahooAPI.getInstance().getQuotes(value);
+                // Aggregate search results across every SEARCH-capable provider so the user
+                // can pull tickers from any backend without a provider picker.
+                List<Instrument> quotes = new ArrayList<>();
+                for (MarketDataProvider p : registry().all()) {
+                    if (!p.capabilities().contains(org.kr.stocksmonitor.api.Capability.SEARCH)) continue;
+                    try {
+                        quotes.addAll(p.searchInstruments(value));
+                    } catch (DataAccessException e) {
+                        log.error("Search failed via provider {}", p.id(), e);
+                    }
+                }
                 Platform.runLater(() -> reloadYahooQuotesCombobox(quotes));
             } catch (Exception e) {
-                log.error("Error while reloading the yahoo quotes", e);
+                log.error("Error while reloading the quotes", e);
             } finally {
-                LogUtils.debugDuration(log, start, "reloading yahoo quotes");
+                LogUtils.debugDuration(log, start, "reloading quotes");
             }
         }, 300, TimeUnit.MILLISECONDS);
         pendingSearch.set(future);
     }
 
-    private void reloadYahooQuotesCombobox(List<QuoteItem> quotes) {
+    private void reloadYahooQuotesCombobox(List<Instrument> quotes) {
         if (quotes.isEmpty()) return;
         log.debug("reloading yahoo quotes: {}", quotes);
-        final ObservableList<QuoteItem> observableList = FXCollections.observableArrayList(quotes);
-        final FilteredList<QuoteItem> filteredData = new FilteredList<>(observableList);
+        final ObservableList<Instrument> observableList = FXCollections.observableArrayList(quotes);
+        final FilteredList<Instrument> filteredData = new FilteredList<>(observableList);
 
         UnaryOperator<TextFormatter.Change> filter = change -> {
             if (null == change) return null;
@@ -1228,14 +1332,14 @@ public class StocksMonitorController implements Initializable {
         // Set up string converter for correct display
         cbxYahooQuote.setConverter(new StringConverter<>() {
             @Override
-            public String toString(QuoteItem o) {
+            public String toString(Instrument o) {
                 if (o == null) return null;
                 return String.format("%s | %s | %s | Exch: %s",
                         o.getQuoteType(), o.getSymbol(), o.getShortname(), o.getExchDisp());
             }
 
             @Override
-            public QuoteItem fromString(String string) { return null; }
+            public Instrument fromString(String string) { return null; }
         });
 
         // Suppress the action handler while we swap items — setItems can clear/change the value
@@ -1341,7 +1445,7 @@ public class StocksMonitorController implements Initializable {
     @FXML protected Tab tabChart;
     @FXML protected Tab tabDividend;
     @FXML protected TabPane tabPaneData;
-    @FXML protected ComboBox<QuoteItem> cbxYahooQuote;
+    @FXML protected ComboBox<Instrument> cbxYahooQuote;
     @FXML protected ComboBox<TargetCurrency> cbxCurrency;
     @FXML protected Button btnRefresh;
     @FXML protected Button btnRemove;
