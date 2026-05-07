@@ -80,6 +80,12 @@ public class StocksMonitorController implements Initializable {
     private TargetCurrency targetCurrency = TargetCurrency.Native;
     private static final int DEFAULT_HISTORY_DAYS = 365;
     private static final int DEFAULT_SLIDER_POSITION = 10; // matches "1 year" in applyDateRange
+    // While restoring persisted UI state we want listeners to NOT trigger a re-save round trip.
+    private final AtomicBoolean restoringSettings = new AtomicBoolean(false);
+    // Slider drags fire many events — coalesce settings writes to avoid disk thrash.
+    // Keys accumulate into pendingSettings; a single debounced flush writes all dirty keys at once.
+    private final Map<String, Object> pendingSettings = new ConcurrentHashMap<>();
+    private final AtomicReference<ScheduledFuture<?>> pendingSettingsFlush = new AtomicReference<>();
     private static final DateTimeFormatter NEWS_DATE_FORMAT =
             DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm").withZone(ZoneId.systemDefault());
     private static final DateTimeFormatter HIST_DATE_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd");
@@ -105,16 +111,34 @@ public class StocksMonitorController implements Initializable {
     @Override
     public void initialize(URL url, ResourceBundle resourceBundle) {
         log.debug("initializing the controller...");
-        initYahoooSymbolsCombobox();
-        initYahoooTableView();
-        initDatePickers();
-        initCurrencyCombobox();
-        initRefreshButton();
+        ConfigManager.AppSettings settings = ConfigManager.getInstance().readSettings();
+        // Restore in a window where listeners are no-ops, so we don't echo the loaded value back to disk.
+        restoringSettings.set(true);
+        try {
+            initYahoooSymbolsCombobox(settings);
+            initYahoooTableView();
+            initDatePickers(settings);
+            initCurrencyCombobox(settings);
+            initToolbarButtons();
+            restoreLastTab(settings);
+        } finally {
+            restoringSettings.set(false);
+        }
     }
 
-    private void initRefreshButton() {
-        if (btnRefresh == null) return;
-        btnRefresh.setOnAction(_ -> forceRefreshActiveTab());
+    private void restoreLastTab(ConfigManager.AppSettings settings) {
+        if (settings == null || settings.lastTab() == null || settings.lastTab().isEmpty()) return;
+        for (Tab t : tabPaneData.getTabs()) {
+            if (settings.lastTab().equals(t.getText())) {
+                tabPaneData.getSelectionModel().select(t);
+                return;
+            }
+        }
+    }
+
+    private void initToolbarButtons() {
+        if (btnRefresh != null) btnRefresh.setOnAction(_ -> forceRefreshActiveTab());
+        if (btnRemove != null) btnRemove.setOnAction(_ -> removeSelectedFavorites());
     }
 
     /** User-initiated refresh: invalidate cached data for selected symbols, then reload the visible tab. */
@@ -126,12 +150,19 @@ public class StocksMonitorController implements Initializable {
         handleSelectedQuotes(selected);
     }
 
-    private void initCurrencyCombobox() {
+    private void initCurrencyCombobox(ConfigManager.AppSettings settings) {
         cbxCurrency.setItems(FXCollections.observableArrayList(TargetCurrency.values()));
-        cbxCurrency.getSelectionModel().select(TargetCurrency.Native);
+        TargetCurrency initial = TargetCurrency.Native;
+        if (settings != null && settings.currency() != null && !settings.currency().isEmpty()) {
+            try { initial = TargetCurrency.valueOf(settings.currency()); }
+            catch (IllegalArgumentException ignore) { /* persisted value no longer valid — keep default */ }
+        }
+        targetCurrency = initial;
+        cbxCurrency.getSelectionModel().select(initial);
         cbxCurrency.valueProperty().addListener((_, _, newValue) -> {
             if (newValue == null) return;
             targetCurrency = newValue;
+            if (!restoringSettings.get()) persistSettingAsync(ConfigManager.KEY_CURRENCY, newValue.name());
             refreshCurrentTab();
         });
     }
@@ -140,17 +171,33 @@ public class StocksMonitorController implements Initializable {
         handleSelectedQuotes(yahooTableFavoriteQuotes.getSelectionModel().getSelectedItems());
     }
 
-    private void initDatePickers() {
-        // Default to the last 365 days. Set values BEFORE attaching listeners so
-        // the slider listener doesn't override the explicit minusDays(365) bound.
+    private void initDatePickers(ConfigManager.AppSettings settings) {
+        // Set values BEFORE attaching listeners so the slider listener doesn't override the explicit bounds.
         LocalDate today = LocalDate.now();
-        yahooStartDatePicker.setValue(today.minusDays(DEFAULT_HISTORY_DAYS));
-        yahooEndDatePicker.setValue(today);
-        yahooDateRangeLabel.setText("1 year");
-        yahooDateRangeSlider.setValue(DEFAULT_SLIDER_POSITION);
-        yahooDateRangeSlider.valueProperty().addListener((_, _, _) -> setDatePickersBasedOnSlider());
-        yahooStartDatePicker.valueProperty().addListener((_, _, _) -> scheduleDateDependentReload());
-        yahooEndDatePicker.valueProperty().addListener((_, _, _) -> scheduleDateDependentReload());
+        LocalDate start = (settings != null && settings.startDate() != null)
+                ? settings.startDate() : today.minusDays(DEFAULT_HISTORY_DAYS);
+        LocalDate end = (settings != null && settings.endDate() != null)
+                ? settings.endDate() : today;
+        int sliderPos = (settings != null && settings.sliderValue() > 0)
+                ? settings.sliderValue() : DEFAULT_SLIDER_POSITION;
+        yahooStartDatePicker.setValue(start);
+        yahooEndDatePicker.setValue(end);
+        yahooDateRangeSlider.setValue(sliderPos);
+        applyDateRangeLabel(sliderPos, yahooDateRangeLabel);
+        yahooDateRangeSlider.valueProperty().addListener((_, _, _) -> {
+            setDatePickersBasedOnSlider();
+            if (!restoringSettings.get()) persistSettingAsync(ConfigManager.KEY_SLIDER_VALUE, (int) yahooDateRangeSlider.getValue());
+        });
+        yahooStartDatePicker.valueProperty().addListener((_, _, newValue) -> {
+            if (!restoringSettings.get() && newValue != null)
+                persistSettingAsync(ConfigManager.KEY_START_DATE, newValue.toString());
+            scheduleDateDependentReload();
+        });
+        yahooEndDatePicker.valueProperty().addListener((_, _, newValue) -> {
+            if (!restoringSettings.get() && newValue != null)
+                persistSettingAsync(ConfigManager.KEY_END_DATE, newValue.toString());
+            scheduleDateDependentReload();
+        });
     }
 
     private void initYahoooTableView() {
@@ -172,7 +219,15 @@ public class StocksMonitorController implements Initializable {
         });
 
         loadFavoriteQuotes();
+        // Persist favorites on every add/remove — don't wait for shutdown.
+        yahooTableFavoriteQuotes.getItems().addListener((ListChangeListener<QuoteItem>) c -> {
+            if (restoringSettings.get()) return;
+            persistFavoritesAsync();
+        });
         tabPaneData.getSelectionModel().selectedItemProperty().addListener((_, _, newValue) -> {
+            if (newValue == null) return;
+            if (!restoringSettings.get())
+                persistSettingAsync(ConfigManager.KEY_LAST_TAB, newValue.getText());
             if (newValue == tabNews) handleTabNewsSelection();
             else if (newValue == tabData) handleTabDataSelection();
             else if (newValue == tabHistory) handleTabHistorySelection();
@@ -180,6 +235,13 @@ public class StocksMonitorController implements Initializable {
             else if (newValue == tabDividend) handleTabDividendSelection();
         });
         setYahooTableFavoriteQuotesColumns();
+        yahooTableFavoriteQuotes.setColumnResizePolicy(TableView.CONSTRAINED_RESIZE_POLICY_ALL_COLUMNS);
+    }
+
+    private void persistFavoritesAsync() {
+        // Snapshot the items on the FX thread; write off-thread.
+        List<QuoteItem> snapshot = new ArrayList<>(yahooTableFavoriteQuotes.getItems());
+        executorService.submit(() -> ConfigManager.getInstance().saveFavoriteQuotes(snapshot));
     }
 
     private void removeSelectedFavorites() {
@@ -1000,7 +1062,7 @@ public class StocksMonitorController implements Initializable {
         yahooTableFavoriteQuotes.getItems().addAll(favQuotes);
     }
 
-    private void initYahoooSymbolsCombobox() {
+    private void initYahoooSymbolsCombobox(ConfigManager.AppSettings settings) {
         ComboBoxListViewSkin<QuoteItem> skin = new ComboBoxListViewSkin<>(cbxYahooQuote);
         skin.getPopupContent().addEventFilter(KeyEvent.ANY, e -> {
             if (e.getCode() == KeyCode.UNDEFINED) {
@@ -1017,7 +1079,8 @@ public class StocksMonitorController implements Initializable {
 
         cbxYahooQuote.getEditor().textProperty().addListener((_, _, newValue) -> {
             reloadYahooTickerCombobox(newValue);
-            if (newValue != null && !newValue.isEmpty()) ConfigManager.getInstance().saveLastSearchTerm(newValue);
+            if (newValue != null && !newValue.isEmpty() && !restoringSettings.get())
+                persistSettingAsync(ConfigManager.KEY_LAST_SEARCH_TERM, newValue);
         });
         cbxYahooQuote.setOnAction(_ -> {
             if (suppressQuoteAction.get()) return;
@@ -1033,8 +1096,8 @@ public class StocksMonitorController implements Initializable {
         });
         // Pre-warm the search with the last term the user used (or a default for first launch).
         // Must run on the FX thread because reloadYahooTickerCombobox touches cbxYahooQuote.
-        String prewarm = ConfigManager.getInstance().readLastSearchTerm();
-        if (prewarm == null || prewarm.isEmpty()) prewarm = "ACN";
+        String prewarm = (settings != null && settings.lastSearchTerm() != null && !settings.lastSearchTerm().isEmpty())
+                ? settings.lastSearchTerm() : "ACN";
         final String prewarmTerm = prewarm;
         Platform.runLater(() -> reloadYahooTickerCombobox(prewarmTerm));
     }
@@ -1113,14 +1176,64 @@ public class StocksMonitorController implements Initializable {
 
     public void shutdown() throws IOException {
         log.debug("shutting down the controller");
+        // Flush any debounced settings synchronously before tearing down the executors.
+        flushPendingSettings();
         debounceExecutor.shutdownNow();
         executorService.shutdownNow();
+        // Safety net — auto-save runs on every change, but write once more in case the last change
+        // is still in-flight on the (now shut-down) executor.
         ConfigManager.getInstance().saveFavoriteQuotes(yahooTableFavoriteQuotes.getItems());
     }
 
     private void setDatePickersBasedOnSlider() {
         applyDateRange((int) yahooDateRangeSlider.getValue(), yahooDateRangeLabel, yahooStartDatePicker, yahooEndDatePicker);
     }
+
+    /** Refresh just the slider's text label without touching the date pickers — used at startup. */
+    private static void applyDateRangeLabel(int value, Label label) {
+        switch (value) {
+            case 1:  label.setText("1 day");    break;
+            case 2:  label.setText("2 days");   break;
+            case 3:  label.setText("3 days");   break;
+            case 4:  label.setText("1 week");   break;
+            case 5:  label.setText("2 weeks");  break;
+            case 6:  label.setText("1 month");  break;
+            case 7:  label.setText("2 months"); break;
+            case 8:  label.setText("3 months"); break;
+            case 9:  label.setText("6 months"); break;
+            case 10: label.setText("1 year");   break;
+            case 11: label.setText("2 years");  break;
+            case 12: label.setText("3 years");  break;
+            case 13: label.setText("5 years");  break;
+            case 14: label.setText("10 years"); break;
+            case 15: label.setText("MAX");      break;
+            default: label.setText("");         break;
+        }
+    }
+
+    /**
+     * Coalesce settings writes so a slider drag doesn't generate dozens of disk writes.
+     * All distinct keys touched within the debounce window are flushed together in one batch.
+     */
+    private void persistSettingAsync(String key, Object value) {
+        // ConcurrentHashMap doesn't allow null values — encode "remove this key" as a sentinel.
+        pendingSettings.put(key, value == null ? NULL_SENTINEL : value);
+        ScheduledFuture<?> prev = pendingSettingsFlush.getAndSet(null);
+        if (prev != null) prev.cancel(false);
+        ScheduledFuture<?> future = debounceExecutor.schedule(this::flushPendingSettings,
+                150, TimeUnit.MILLISECONDS);
+        pendingSettingsFlush.set(future);
+    }
+
+    private void flushPendingSettings() {
+        if (pendingSettings.isEmpty()) return;
+        Map<String, Object> snapshot = new HashMap<>(pendingSettings);
+        pendingSettings.clear();
+        snapshot.replaceAll((k, v) -> v == NULL_SENTINEL ? null : v);
+        ConfigManager.getInstance().saveSettings(snapshot);
+    }
+
+    private static final Object NULL_SENTINEL = new Object();
 
     static void applyDateRange(int value, Label label, DatePicker start, DatePicker end) {
         LocalDate today = LocalDate.now();
@@ -1154,4 +1267,5 @@ public class StocksMonitorController implements Initializable {
     @FXML protected ComboBox<QuoteItem> cbxYahooQuote;
     @FXML protected ComboBox<TargetCurrency> cbxCurrency;
     @FXML protected Button btnRefresh;
+    @FXML protected Button btnRemove;
 }

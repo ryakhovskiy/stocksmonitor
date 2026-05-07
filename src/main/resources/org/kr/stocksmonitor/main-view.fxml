@@ -33,6 +33,7 @@
                                         <Slider fx:id="yahooDateRangeSlider" blockIncrement="1.0" layoutX="738.0" layoutY="74.0" max="15.0" min="1.0" prefHeight="14.0" prefWidth="196.0" value="1.0" AnchorPane.rightAnchor="20.0" AnchorPane.topAnchor="74.0" />
                                         <Label fx:id="yahooDateRangeLabel" layoutX="427.0" layoutY="108.0" text="..." AnchorPane.rightAnchor="200.0" AnchorPane.topAnchor="95.0" />
                                         <Button fx:id="btnRefresh" layoutX="14.0" layoutY="74.0" mnemonicParsing="false" prefHeight="25.0" prefWidth="60.0" text="⟲" AnchorPane.leftAnchor="14.0" AnchorPane.topAnchor="74.0" />
+                                        <Button fx:id="btnRemove" layoutX="80.0" layoutY="74.0" mnemonicParsing="false" prefHeight="25.0" prefWidth="80.0" text="Remove" AnchorPane.leftAnchor="80.0" AnchorPane.topAnchor="74.0" />
                                         <Label layoutX="14.0" layoutY="102.0" prefHeight="17.0" prefWidth="106.0" text="Favorite Tickers" AnchorPane.leftAnchor="14.0" AnchorPane.topAnchor="102.0" />
                                         <TableView fx:id="yahooTableFavoriteQuotes" layoutX="14.0" layoutY="119.0" prefHeight="167.0" prefWidth="938.0" AnchorPane.bottomAnchor="10.0" AnchorPane.leftAnchor="10.0" AnchorPane.rightAnchor="10.0" AnchorPane.topAnchor="118.0" />
                                     </children>

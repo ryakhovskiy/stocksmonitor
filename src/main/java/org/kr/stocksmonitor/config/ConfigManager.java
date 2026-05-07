@@ -14,9 +14,12 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.time.Instant;
+import java.time.LocalDate;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 
 public class ConfigManager {
 
@@ -28,6 +31,13 @@ public class ConfigManager {
     // Old location used before the migration to user.home — read-only fallback / one-shot import.
     private static final Path LEGACY_FAVORITE_QUOTES_PATH = Paths.get(System.getProperty("user.dir"), ".favquotes.json");
 
+    public static final String KEY_LAST_SEARCH_TERM = "lastSearchTerm";
+    public static final String KEY_CURRENCY = "currency";
+    public static final String KEY_START_DATE = "startDate";
+    public static final String KEY_END_DATE = "endDate";
+    public static final String KEY_SLIDER_VALUE = "sliderValue";
+    public static final String KEY_LAST_TAB = "lastTab";
+
     private static final ConfigManager instance = new ConfigManager();
 
     public static ConfigManager getInstance() {
@@ -36,6 +46,17 @@ public class ConfigManager {
 
     private final Object favoritesLock = new Object();
     private final Object settingsLock = new Object();
+
+    /**
+     * Snapshot of persisted UI settings used to restore state at startup.
+     * Any field may be null/-1 when not previously persisted; callers fall back to defaults.
+     */
+    public record AppSettings(String lastSearchTerm,
+                              String currency,
+                              LocalDate startDate,
+                              LocalDate endDate,
+                              int sliderValue,
+                              String lastTab) {}
 
     private ConfigManager() {
         try {
@@ -89,23 +110,7 @@ public class ConfigManager {
         for (QuoteItem quote : quotes)
             jsonArray.put(quote.toJsonObject());
         synchronized (favoritesLock) {
-            // Atomic write: stage to .tmp then move into place so a crash never leaves a half-written file.
-            Path tmp = FAVORITE_QUOTES_PATH.resolveSibling(FAVORITE_QUOTES_PATH.getFileName() + ".tmp");
-            try {
-                Files.writeString(tmp, jsonArray.toString(), StandardCharsets.UTF_8);
-                try {
-                    Files.move(tmp, FAVORITE_QUOTES_PATH,
-                            StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-                } catch (IOException atomicFailed) {
-                    // Some Windows file systems / cross-volume moves can't do atomic — fall back.
-                    Files.move(tmp, FAVORITE_QUOTES_PATH, StandardCopyOption.REPLACE_EXISTING);
-                }
-                logger.debug("Favorite yahoo quotes saved at: {}", FAVORITE_QUOTES_PATH);
-            } catch (IOException e) {
-                logger.error("Cannot save favorite yahoo quotes", e);
-            } finally {
-                try { Files.deleteIfExists(tmp); } catch (IOException ignore) {}
-            }
+            atomicWriteString(FAVORITE_QUOTES_PATH, jsonArray.toString());
         }
         LogUtils.debugDuration(logger, start, "saving the favorite yahoo quotes into the config");
     }
@@ -116,38 +121,91 @@ public class ConfigManager {
         saveFavoriteQuotes(fileQuotes);
     }
 
-    public String readLastSearchTerm() {
+    public AppSettings readSettings() {
         synchronized (settingsLock) {
-            try {
-                if (!Files.exists(SETTINGS_PATH)) return "";
-                String content = Files.readString(SETTINGS_PATH);
-                if (content.isEmpty()) return "";
-                return new JSONObject(content).optString("lastSearchTerm", "");
-            } catch (IOException e) {
-                logger.warn("Cannot read settings file", e);
-                return "";
-            }
+            JSONObject obj = readSettingsObject();
+            return new AppSettings(
+                    obj.optString(KEY_LAST_SEARCH_TERM, ""),
+                    obj.optString(KEY_CURRENCY, ""),
+                    parseDate(obj.optString(KEY_START_DATE, "")),
+                    parseDate(obj.optString(KEY_END_DATE, "")),
+                    obj.optInt(KEY_SLIDER_VALUE, -1),
+                    obj.optString(KEY_LAST_TAB, "")
+            );
         }
+    }
+
+    /** Read-modify-write a single setting. Cheap (settings.json is tiny), but callers should still debounce noisy sources. */
+    public void saveSetting(String key, Object value) {
+        if (key == null) return;
+        synchronized (settingsLock) {
+            JSONObject obj = readSettingsObject();
+            if (value == null) obj.remove(key);
+            else obj.put(key, value);
+            writeSettingsObject(obj);
+        }
+    }
+
+    /** Atomic write of multiple settings at once — preferable to N back-to-back saveSetting calls. */
+    public void saveSettings(Map<String, Object> values) {
+        if (values == null || values.isEmpty()) return;
+        synchronized (settingsLock) {
+            JSONObject obj = readSettingsObject();
+            for (Map.Entry<String, Object> e : values.entrySet()) {
+                if (e.getValue() == null) obj.remove(e.getKey());
+                else obj.put(e.getKey(), e.getValue());
+            }
+            writeSettingsObject(obj);
+        }
+    }
+
+    public String readLastSearchTerm() {
+        return readSettings().lastSearchTerm();
     }
 
     public void saveLastSearchTerm(String term) {
         if (term == null) return;
-        synchronized (settingsLock) {
-            JSONObject obj = new JSONObject();
-            try {
-                if (Files.exists(SETTINGS_PATH)) {
-                    String existing = Files.readString(SETTINGS_PATH);
-                    if (!existing.isEmpty()) obj = new JSONObject(existing);
-                }
-            } catch (IOException e) {
-                logger.warn("Cannot read settings file before write — overwriting", e);
-            }
-            obj.put("lastSearchTerm", term);
-            try {
-                Files.writeString(SETTINGS_PATH, obj.toString(), StandardCharsets.UTF_8);
-            } catch (IOException e) {
-                logger.error("Cannot write settings file", e);
-            }
+        saveSetting(KEY_LAST_SEARCH_TERM, term);
+    }
+
+    private JSONObject readSettingsObject() {
+        try {
+            if (!Files.exists(SETTINGS_PATH)) return new JSONObject();
+            String content = Files.readString(SETTINGS_PATH);
+            if (content.isEmpty()) return new JSONObject();
+            return new JSONObject(content);
+        } catch (IOException e) {
+            logger.warn("Cannot read settings file", e);
+            return new JSONObject();
         }
+    }
+
+    private void writeSettingsObject(JSONObject obj) {
+        atomicWriteString(SETTINGS_PATH, obj.toString());
+    }
+
+    private void atomicWriteString(Path target, String content) {
+        // Stage to .tmp then move into place so a crash never leaves a half-written file.
+        Path tmp = target.resolveSibling(target.getFileName() + ".tmp");
+        try {
+            Files.writeString(tmp, content, StandardCharsets.UTF_8);
+            try {
+                Files.move(tmp, target,
+                        StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            } catch (IOException atomicFailed) {
+                // Some Windows file systems / cross-volume moves can't do atomic — fall back.
+                Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING);
+            }
+        } catch (IOException e) {
+            logger.error("Cannot write {}", target, e);
+        } finally {
+            try { Files.deleteIfExists(tmp); } catch (IOException ignore) {}
+        }
+    }
+
+    private static LocalDate parseDate(String s) {
+        if (s == null || s.isEmpty()) return null;
+        try { return LocalDate.parse(s); }
+        catch (DateTimeParseException e) { return null; }
     }
 }
