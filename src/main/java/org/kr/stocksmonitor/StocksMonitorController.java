@@ -57,7 +57,7 @@ import java.util.stream.Collectors;
 public class StocksMonitorController implements Initializable {
 
     private static final Logger log = LogManager.getLogger(StocksMonitorController.class);
-    protected static final ExecutorService executorService = Executors.newFixedThreadPool(16, r -> {
+    protected final ExecutorService executorService = Executors.newFixedThreadPool(16, r -> {
         Thread t = new Thread(r, "stocksmonitor-worker");
         t.setDaemon(true);
         return t;
@@ -109,6 +109,21 @@ public class StocksMonitorController implements Initializable {
         initYahoooTableView();
         initDatePickers();
         initCurrencyCombobox();
+        initRefreshButton();
+    }
+
+    private void initRefreshButton() {
+        if (btnRefresh == null) return;
+        btnRefresh.setOnAction(_ -> forceRefreshActiveTab());
+    }
+
+    /** User-initiated refresh: invalidate cached data for selected symbols, then reload the visible tab. */
+    private void forceRefreshActiveTab() {
+        List<QuoteItem> selected = yahooTableFavoriteQuotes.getSelectionModel().getSelectedItems();
+        for (QuoteItem q : selected) {
+            if (q != null && q.getSymbol() != null) YahooAPI.getInstance().invalidate(q.getSymbol());
+        }
+        handleSelectedQuotes(selected);
     }
 
     private void initCurrencyCombobox() {
@@ -145,6 +160,17 @@ public class StocksMonitorController implements Initializable {
             handleSelectedQuotes(selectedQuotes);
         });
 
+        // Remove via context menu or Delete key.
+        MenuItem removeItem = new MenuItem("Remove");
+        removeItem.setOnAction(_ -> removeSelectedFavorites());
+        yahooTableFavoriteQuotes.setContextMenu(new ContextMenu(removeItem));
+        yahooTableFavoriteQuotes.setOnKeyPressed(e -> {
+            if (e.getCode() == KeyCode.DELETE) {
+                removeSelectedFavorites();
+                e.consume();
+            }
+        });
+
         loadFavoriteQuotes();
         tabPaneData.getSelectionModel().selectedItemProperty().addListener((_, _, newValue) -> {
             if (newValue == tabNews) handleTabNewsSelection();
@@ -154,6 +180,13 @@ public class StocksMonitorController implements Initializable {
             else if (newValue == tabDividend) handleTabDividendSelection();
         });
         setYahooTableFavoriteQuotesColumns();
+    }
+
+    private void removeSelectedFavorites() {
+        // Copy first — getSelectedItems is observable and removeAll mutates it as we go.
+        List<QuoteItem> toRemove = new ArrayList<>(yahooTableFavoriteQuotes.getSelectionModel().getSelectedItems());
+        if (toRemove.isEmpty()) return;
+        yahooTableFavoriteQuotes.getItems().removeAll(toRemove);
     }
 
     private void setYahooTableFavoriteQuotesColumns() {
@@ -177,10 +210,10 @@ public class StocksMonitorController implements Initializable {
                 data.getValue().getLongname()));
         longnameColumn.setPrefWidth(300);
 
-        TableColumn<QuoteItem, String> quoteTypeColumn = new TableColumn<>("Type");
-        quoteTypeColumn.setCellValueFactory(data -> Bindings.createStringBinding(() ->
+        TableColumn<QuoteItem, String> assetClassColumn = new TableColumn<>("Asset Class");
+        assetClassColumn.setCellValueFactory(data -> Bindings.createStringBinding(() ->
                 data.getValue().getQuoteType()));
-        quoteTypeColumn.setPrefWidth(80);
+        assetClassColumn.setPrefWidth(90);
 
         TableColumn<QuoteItem, String> exchangeColumn = new TableColumn<>("Exch");
         exchangeColumn.setCellValueFactory(data -> Bindings.createStringBinding(() ->
@@ -192,19 +225,9 @@ public class StocksMonitorController implements Initializable {
                 data.getValue().getExchDisp()));
         exchDispColumn.setPrefWidth(90);
 
-        TableColumn<QuoteItem, String> indexColumn = new TableColumn<>("Index");
-        indexColumn.setCellValueFactory(data -> Bindings.createStringBinding(() ->
-                data.getValue().getIndex()));
-        indexColumn.setPrefWidth(0);
-
-        TableColumn<QuoteItem, Boolean> isYahooFinanceColumn = new TableColumn<>("Yahoo");
-        isYahooFinanceColumn.setCellValueFactory(data -> Bindings.createBooleanBinding(() ->
-                data.getValue().isYahooFinance()));
-        isYahooFinanceColumn.setPrefWidth(0);
-
         yahooTableFavoriteQuotes.getColumns().clear();
         yahooTableFavoriteQuotes.getColumns().addAll(typeDispColumn, symbolColumn, shortnameColumn, longnameColumn,
-                quoteTypeColumn, exchangeColumn, exchDispColumn, indexColumn, isYahooFinanceColumn);
+                assetClassColumn, exchangeColumn, exchDispColumn);
     }
 
     private void handleSelectedQuotes(List<QuoteItem> selectedQuotes) {
@@ -567,25 +590,43 @@ public class StocksMonitorController implements Initializable {
         final long requestId = dividendRequestId.incrementAndGet();
         executorService.submit(() -> {
             Instant start = Instant.now();
-            List<Dividend> dividends = new ArrayList<>();
-            // Build per-symbol native close map so we can compute yield = amount / close * 100.
-            // Yield is FX-invariant (same rate cancels in num and denom), so we use native closes.
-            Map<String, NavigableMap<LocalDate, Double>> nativeCloseBySymbol = new HashMap<>();
+            // Fetch dividends and history per symbol in parallel — they're independent network calls,
+            // and the dividend tab needs both (yield = amount / close * 100, FX-invariant).
+            List<CompletableFuture<SymbolDividendData>> futures = new ArrayList<>(symbols.size());
             for (String symbol : symbols) {
-                try {
-                    dividends.addAll(YahooAPI.getInstance().getDividends(symbol, from, to));
-                } catch (IOException e) {
-                    log.error("Error fetching dividends for {} {}..{}", symbol, from, to, e);
-                }
-                try {
-                    NavigableMap<LocalDate, Double> closes = new TreeMap<>();
-                    for (HistoricalBar bar : YahooAPI.getInstance().getHistory(symbol, from, to)) {
-                        if (!Double.isNaN(bar.close())) closes.put(bar.date(), bar.close());
+                CompletableFuture<List<Dividend>> divFut = CompletableFuture.supplyAsync(() -> {
+                    try {
+                        return YahooAPI.getInstance().getDividends(symbol, from, to);
+                    } catch (IOException e) {
+                        log.error("Error fetching dividends for {} {}..{}", symbol, from, to, e);
+                        return List.of();
                     }
-                    nativeCloseBySymbol.put(symbol, closes);
-                } catch (IOException e) {
-                    log.error("Error fetching history for yield calc {} {}..{}", symbol, from, to, e);
-                    nativeCloseBySymbol.put(symbol, new TreeMap<>());
+                }, executorService);
+                CompletableFuture<NavigableMap<LocalDate, Double>> histFut = CompletableFuture.supplyAsync(() -> {
+                    NavigableMap<LocalDate, Double> closes = new TreeMap<>();
+                    try {
+                        for (HistoricalBar bar : YahooAPI.getInstance().getHistory(symbol, from, to)) {
+                            if (!Double.isNaN(bar.close())) closes.put(bar.date(), bar.close());
+                        }
+                    } catch (IOException e) {
+                        log.error("Error fetching history for yield calc {} {}..{}", symbol, from, to, e);
+                    }
+                    return closes;
+                }, executorService);
+                futures.add(divFut.thenCombine(histFut, (divs, closes) -> new SymbolDividendData(symbol, divs, closes)));
+            }
+            List<Dividend> dividends = new ArrayList<>();
+            Map<String, NavigableMap<LocalDate, Double>> nativeCloseBySymbol = new HashMap<>();
+            for (CompletableFuture<SymbolDividendData> f : futures) {
+                try {
+                    SymbolDividendData d = f.get();
+                    dividends.addAll(d.dividends());
+                    nativeCloseBySymbol.put(d.symbol(), d.closes());
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return;
+                } catch (ExecutionException ee) {
+                    log.error("Dividend/history fetch failed", ee);
                 }
             }
             dividends.sort(Comparator.comparing(Dividend::date).reversed()
@@ -599,6 +640,10 @@ public class StocksMonitorController implements Initializable {
             LogUtils.debugDuration(log, start, "loading yahoo dividends");
         });
     }
+
+    private record SymbolDividendData(String symbol,
+                                      List<Dividend> dividends,
+                                      NavigableMap<LocalDate, Double> closes) {}
 
     private void renderDividend(List<Dividend> dividends,
                                 FxConverter conv,
@@ -970,7 +1015,10 @@ public class StocksMonitorController implements Initializable {
         cbxYahooQuote.setSkin(skin);
         cbxYahooQuote.setEditable(true);
 
-        cbxYahooQuote.getEditor().textProperty().addListener((_, _, newValue) -> reloadYahooTickerCombobox(newValue));
+        cbxYahooQuote.getEditor().textProperty().addListener((_, _, newValue) -> {
+            reloadYahooTickerCombobox(newValue);
+            if (newValue != null && !newValue.isEmpty()) ConfigManager.getInstance().saveLastSearchTerm(newValue);
+        });
         cbxYahooQuote.setOnAction(_ -> {
             if (suppressQuoteAction.get()) return;
             // Only treat this as a real selection if the dropdown is open (user picked from the list).
@@ -983,7 +1031,12 @@ public class StocksMonitorController implements Initializable {
             if (items.contains(selected)) return;
             items.add(selected);
         });
-        executorService.submit(() -> reloadYahooTickerCombobox("ACN"));
+        // Pre-warm the search with the last term the user used (or a default for first launch).
+        // Must run on the FX thread because reloadYahooTickerCombobox touches cbxYahooQuote.
+        String prewarm = ConfigManager.getInstance().readLastSearchTerm();
+        if (prewarm == null || prewarm.isEmpty()) prewarm = "ACN";
+        final String prewarmTerm = prewarm;
+        Platform.runLater(() -> reloadYahooTickerCombobox(prewarmTerm));
     }
 
     private void reloadYahooTickerCombobox(String value) {
@@ -1100,4 +1153,5 @@ public class StocksMonitorController implements Initializable {
     @FXML protected TabPane tabPaneData;
     @FXML protected ComboBox<QuoteItem> cbxYahooQuote;
     @FXML protected ComboBox<TargetCurrency> cbxCurrency;
+    @FXML protected Button btnRefresh;
 }

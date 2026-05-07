@@ -22,7 +22,7 @@ public class StocksMonitor extends Application {
         FXMLLoader fxmlLoader = new FXMLLoader(StocksMonitor.class.getResource("main-view.fxml"));
         Parent root = fxmlLoader.load();
         Scene scene = new Scene(root);
-        stage.setTitle("Hello!");
+        stage.setTitle("Stocks Monitor");
         stage.setScene(scene);
         stage.show();
 
